@@ -187,6 +187,29 @@ export class PromptCaptures {
 	}
 }
 
+// Shared across module instances for the same reason the active streamSimple is
+// (see ACTIVE_STREAM_SIMPLE_KEY in src/index.ts): an isolated sub-agent runs in a
+// fresh child session that re-evaluates this module, so it gets its own registry —
+// but the provider stream stays pinned to the *first* instance. The child records
+// its agent's prompt from `before_agent_start`, the parent stream looks it up, and
+// with per-instance registries those are two different maps. The lookup misses, and
+// an isolated replace-mode prompt embeds no ancestor prompt for findInheritedPrompts
+// to fall back on, so the turn throws. One registry per process makes record and
+// lookup agree regardless of which instance did which.
+const SHARED_CAPTURES_KEY = Symbol.for("claude-bridge:promptCaptures");
+
+/** The one registry every module instance in this process records into and reads from.
+ *
+ *  Deliberately not cleared on session_shutdown, unlike the pinned stream: sibling
+ *  sessions in the same process share this registry, and dropping it under a live one
+ *  would fail its next turn. Growth is bounded instead — the LRU cap inside
+ *  PromptCaptures (256 keys) now bounds the whole process rather than each instance,
+ *  so a long-lived process running many sessions retains strictly less than before. */
+export function sharedPromptCaptures(): PromptCaptures {
+	const globals = globalThis as Record<symbol, PromptCaptures | undefined>;
+	return (globals[SHARED_CAPTURES_KEY] ??= new PromptCaptures());
+}
+
 export function projectPromptCapture(
 	capture: PromptCapture,
 	options: { skillReadTool: SkillReadTool },

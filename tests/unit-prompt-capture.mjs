@@ -2,7 +2,12 @@
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { collectPromptSkills, projectPromptCapture, PromptCaptures } from "../src/prompt-capture.js";
+import {
+	collectPromptSkills,
+	projectPromptCapture,
+	PromptCaptures,
+	sharedPromptCaptures,
+} from "../src/prompt-capture.js";
 
 const PI_HARNESS = "You are an expert coding assistant operating inside pi. Pi documentation: pi packages (docs/packages.md).";
 const PARENT_KEY = `${PI_HARNESS}\n\n<project_context>raw parent context</project_context>\nCurrent working directory: /parent`;
@@ -239,5 +244,32 @@ describe("PromptCaptures", () => {
 		assert.equal(captures.resolve("b"), undefined);
 		assert.equal(captures.resolve("a").custom, "refreshed");
 		assert.ok(captures.resolve("c") && captures.resolve("d"));
+	});
+
+	// An isolated sub-agent's replace-mode prompt: no ancestor prompt embedded, so
+	// findInheritedPrompts has nothing to fall back on and only an exact key saves it.
+	it("resolves an isolated agent's prompt recorded by another module instance", async () => {
+		// A fresh child session re-evaluates this module. The query string reproduces
+		// that here; the pinned parent stream keeps using the first instance.
+		const childModule = await import("../src/prompt-capture.js?instance=isolated-child");
+		assert.notEqual(childModule.PromptCaptures, PromptCaptures, "expected a distinct module instance");
+
+		const ISOLATED_KEY = "You are a smoke-test agent. Respond with exactly \"ZZ_ISO_OK\" and nothing else.";
+		childModule.sharedPromptCaptures().record(ISOLATED_KEY, capture({
+			custom: ISOLATED_KEY,
+			contextFiles: [{ path: "/AGENTS.md", content: "isolated rules" }],
+		}));
+
+		const resolved = sharedPromptCaptures().resolveOrDerive(ISOLATED_KEY);
+		assert.equal(resolved?.assembledPrompt, ISOLATED_KEY);
+		assert.equal(resolved?.contextFiles[0].content, "isolated rules");
+		assert.ok(projectPromptCapture(resolved, { skillReadTool: "mcp" })?.includes("isolated rules"));
+	});
+
+	it("bounds the shared registry now that it outlives a single session", () => {
+		const shared = sharedPromptCaptures();
+		for (let i = 0; i < 400; i++) shared.record(`shared-session-key-${i}`, capture());
+		assert.ok(shared.size <= 256, `shared registry grew to ${shared.size}`);
+		assert.ok(shared.resolve("shared-session-key-399"), "most recent key evicted");
 	});
 });

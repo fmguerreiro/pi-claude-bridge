@@ -9,6 +9,7 @@
 import type { AssistantMessage, AssistantMessageEventStream, Model } from "@earendil-works/pi-ai";
 import type { McpResult } from "./extract-tool-results.js";
 import type { PromptStream } from "./prompt-stream.js";
+import type { StreamMonitor } from "./stream-resilience.js";
 
 export interface PendingToolCall {
 	toolName: string;
@@ -28,6 +29,10 @@ export class QueryContext {
 	turnToolCallIds: string[] = [];
 	/** Streaming-input handle for the active query — how steers reach CC mid-turn. */
 	promptStream: PromptStream | null = null;
+	/** Idle-stall watchdog + rate-limit observer for the SDK query currently being
+	 *  consumed. Replaced on every attempt (a retry gets a fresh one) and null
+	 *  outside a query, so consumeQuery pokes it optionally. */
+	streamMonitor: StreamMonitor | null = null;
 
 	// Per-turn (reset together)
 	turnOutput: AssistantMessage | null = null;

@@ -10,6 +10,9 @@
 import { describe, it, before } from "node:test";
 import assert from "node:assert/strict";
 import { createToolServer } from "../src/mcp-server.js";
+import { QueryContext } from "../src/query-state.js";
+
+const { __test } = await import("../src/index.js");
 
 const NESTED_TOOL_SCHEMA = {
 	type: "object",
@@ -234,5 +237,74 @@ describe("MCP tool invocation", () => {
 		const res = await callTool("strict", "toolu_y", { count: "not-a-number", extra: 1 });
 		assert.ok(called, "handler must run — pi validates and executes tools, not the MCP layer");
 		assert.strictEqual(res.result.content[0].text, "ran");
+	});
+});
+
+/**
+ * Serving a tool is only half of it: Claude Code runs its own permission layer
+ * in front of every call, and a tool it refuses to dispatch never reaches the
+ * server above. The host has already executed the call by then — the bridge
+ * streams CC's tool_use to pi as it arrives — so its result comes back to a
+ * handler that does not exist, parks in `pendingResults` forever, and the turn
+ * ends with Claude announcing it has no permission to use its tools.
+ *
+ * That is what happened whenever `permissionMode: "bypassPermissions"` was
+ * demoted to "default" by a settings estate the bridge does not control (an
+ * organization policy setting `disableBypassPermissionsMode`). The allow rules
+ * are the part that does not depend on the mode, so they are the invariant:
+ * everything advertised must also be declared.
+ */
+describe("MCP tool permission declaration", () => {
+	// pi's Tool shape (name/description/parameters), which is what the provider
+	// hands both buildMcpServers and mcpAllowedTools.
+	const piTools = [
+		{ name: "read", description: "read a file", parameters: { type: "object", properties: {} } },
+		{ name: "bash", description: "run a command", parameters: { type: "object", properties: {} } },
+	];
+
+	it("declares an allow rule for every tool it advertises", async () => {
+		const servers = __test.buildMcpServers(piTools, new QueryContext());
+		const { request } = await connectClient(servers["custom-tools"]);
+
+		const advertised = (await request("tools/list", {})).result.tools.map((tool) => tool.name);
+		assert.deepStrictEqual(
+			__test.mcpAllowedTools(piTools),
+			advertised.map((name) => `mcp__custom-tools__${name}`),
+			"an advertised tool with no allow rule is one Claude Code will deny, orphaning its result",
+		);
+	});
+
+	// Empty rather than a placeholder: the SDK omits --allowedTools for an empty
+	// array, and CC treats an empty rule string as a rule that matches nothing.
+	it("declares nothing when no tools are served", () => {
+		assert.deepStrictEqual(__test.mcpAllowedTools([]), []);
+	});
+
+	it("delivers the host's result to the handler the dispatched call parked", async () => {
+		const queryCtx = new QueryContext();
+		const servers = __test.buildMcpServers(piTools, queryCtx);
+		const { callTool } = await connectClient(servers["custom-tools"]);
+
+		const call = callTool("read", "toolu_allowed");
+		// The handler parks synchronously inside the tools/call, but the JSON-RPC
+		// round trip is async — wait for the registration rather than racing it.
+		while (!queryCtx.pendingToolCalls.has("toolu_allowed")) await new Promise((r) => setImmediate(r));
+
+		await __test.deliverToolResults(queryCtx, [{ toolCallId: "toolu_allowed", content: [{ type: "text", text: "secret-marker" }] }], null, 1);
+
+		assert.strictEqual((await call).result.content[0].text, "secret-marker");
+		assert.strictEqual(queryCtx.pendingResults.size, 0, "a delivered result must not also queue");
+	});
+
+	// The regression signature, asserted directly: no dispatch means no waiting
+	// handler, and the result the host already produced has nowhere to go.
+	it("orphans the result when the call was never dispatched to the server", async () => {
+		const queryCtx = new QueryContext();
+		__test.buildMcpServers(piTools, queryCtx);
+
+		await __test.deliverToolResults(queryCtx, [{ toolCallId: "toolu_denied", content: [{ type: "text", text: "secret-marker" }] }], null, 1);
+
+		assert.strictEqual(queryCtx.pendingToolCalls.size, 0);
+		assert.strictEqual(queryCtx.pendingResults.size, 1);
 	});
 });

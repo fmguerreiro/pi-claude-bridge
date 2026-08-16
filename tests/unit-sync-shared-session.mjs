@@ -23,6 +23,9 @@ describe("syncSharedSession", () => {
 	// session is preserved. It was previously described here as the compact-summary
 	// path, which cannot reach syncSharedSession at all, so the branch read as
 	// covered for a case that never happens.
+	// The reentrant flag is what selects this branch: on a top-level turn the same
+	// shorter context means pi rewrote its own history, and rebuilding from it is
+	// the only way to keep the conversation (see unit-session-sync.mjs).
 	it("starts a fresh session for a shorter context and preserves the parent's", () => {
 		const cwd = mkdtempSync(join(tmpdir(), "sync-shared-session-"));
 		try {
@@ -39,7 +42,7 @@ describe("syncSharedSession", () => {
 					content: "Summarize this conversation.",
 					timestamp: Date.now(),
 				},
-			], cwd);
+			], cwd, undefined, undefined, { reentrant: true });
 
 			assert.equal(
 				result.sessionId,

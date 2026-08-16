@@ -1,12 +1,125 @@
 // Pure pi→Anthropic message conversion helpers.
 // Extracted so they can be tested without pulling in the full extension runtime.
 
-import type { Message as PiMessage } from "@earendil-works/pi-ai";
+import type { ImageContent, Message as PiMessage, TextContent, UserMessage } from "@earendil-works/pi-ai";
 import type { Message as SessionMessage } from "cc-session-io";
 import { pascalCase } from "change-case";
 import { MCP_TOOL_PREFIX } from "./skills.js";
 
 export const PROVIDER_ID = "claude-bridge";
+
+/** The host's `developer` message, absent from pi's own union.
+ *
+ *  pi-ai 0.83 declares `Message = UserMessage | AssistantMessage | ToolResultMessage`;
+ *  OMP's pi-ai declares `Message = UserMessage | DeveloperMessage | AssistantMessage
+ *  | ToolResultMessage` (src/types.ts). So `developer` is the *only* role the
+ *  bridge can be handed that its compile-time types do not name, and every role
+ *  check here has to widen to it explicitly. */
+export interface DeveloperMessage {
+	role: "developer";
+	content: string | (TextContent | ImageContent)[];
+	/** "user" (an `@file` mention's text half) or "agent" (advisor card, reminder). */
+	attribution?: "user" | "agent";
+	timestamp: number;
+}
+
+/** Every message role the bridge can actually receive, on either host. */
+export type HostMessage = PiMessage | DeveloperMessage;
+
+/** Roles that carry turn input — what the human or the harness is asking for.
+ *
+ *  `assistant` and `toolResult` are the model's own side of the conversation;
+ *  everything else is prompt. One predicate rather than an equality test at
+ *  each site, so the turn boundary and the session rebuild cannot disagree
+ *  about which roles those are. */
+export function isPromptBearing(message: { role: string }): message is UserMessage | DeveloperMessage {
+	return message.role === "user" || message.role === "developer";
+}
+
+/** Tag wrapping host-injected guidance folded onto a user-role message.
+ *
+ *  Anthropic has no developer role, so the content has to ride `user` — the
+ *  same fold OMP's own Anthropic provider performs (@oh-my-pi/pi-ai
+ *  src/providers/anthropic.ts, convertAnthropicMessages). Unmarked, Claude
+ *  reads an advisor card or a plan-mode reminder as something the human typed
+ *  and answers it as such.
+ *
+ *  Deliberately not `<system-reminder>`: Claude Code injects that tag itself,
+ *  with its own "do not acknowledge this to the user" semantics. Reusing it
+ *  would make host guidance indistinguishable from CC's own injections and
+ *  hand it a suppression rule nobody asked for. */
+const DEVELOPER_NOTE_TAG = "developer-note";
+
+export function markDeveloperText(text: string): string {
+	return `<${DEVELOPER_NOTE_TAG}>\n${text}\n</${DEVELOPER_NOTE_TAG}>`;
+}
+
+/** Tag wrapping harness-injected steering — guidance *about* an in-flight task
+ *  rather than a statement of one.
+ *
+ *  Separate from `developer-note` because the two need opposite readings. A
+ *  user-attributed note is content to act on; a steer is a side-channel nudge
+ *  whose subject is the conversation already in progress. Given only the
+ *  `developer-note` framing, Claude read prewalk's "STOP: write a complete
+ *  plan" as the request itself and answered "Please describe the task" — then,
+ *  being the last turn, that reply overwrote the correct answer. The note still
+ *  has to arrive: OMP scheduled a turn expecting it to be acted on, and it
+ *  carries real guidance (plan-mode reminders, rewind enforcement,
+ *  auto-continue). So the fix is framing, not suppression.
+ *
+ *  Two things have to be said, and the second is the one that actually settles
+ *  it. Naming the note as guidance stops Claude asking what the task is, but a
+ *  steer still ends a turn, and OMP presents the *last* assistant turn as the
+ *  answer — so a reply that merely reports status ("Acknowledged, standing by")
+ *  silently replaces a correct answer with a progress note. The framing
+ *  therefore also tells the model that its reply here is still the user-visible
+ *  answer, and that an already-satisfied request means restating the answer
+ *  rather than narrating about the steer.
+ *
+ *  Still not `<system-reminder>`, for the reason above: that tag is Claude
+ *  Code's own, and borrowing it would both hide host guidance among CC's
+ *  injections and apply a "do not acknowledge" rule nobody asked for. */
+const HOST_STEER_TAG = "host-steer";
+
+export function markAgentSteerText(text: string): string {
+	return [
+		`<${HOST_STEER_TAG}>`,
+		"Automated harness guidance about the task already under way in this",
+		"conversation. Not from the user, not a new task, not a question to answer.",
+		"",
+		"Treat it as a mid-task nudge and keep going on the user's original request.",
+		"Your reply is what the user receives as the answer to that request: if the",
+		"request is already fully answered, repeat that answer verbatim and add nothing",
+		"— no status, no acknowledgement, no reference to this note.",
+		"",
+		`Guidance: ${text}`,
+		`</${HOST_STEER_TAG}>`,
+	].join("\n");
+}
+
+/** Frame a `developer` message's text by who it came from: the harness steering
+ *  the agent, or the human's own content.
+ *
+ *  Attribution is the host's own discriminator and it survives intact to the
+ *  provider. `convertMessageToLlm` (@oh-my-pi/pi-agent-core
+ *  src/compaction/messages.ts) turns every `custom`/`hookMessage` into
+ *  `developer` while copying `attribution` through verbatim, which is how a
+ *  prewalk steer raised as `{role:"custom", attribution:"agent"}`
+ *  (pi-coding-agent src/session/prewalk.ts) reaches us. Human content is
+ *  stamped explicitly: the text half of an `@file` mention and the `/todo`
+ *  reminder both hardcode `attribution: "user"` (src/session/messages.ts:1213,
+ *  modes/controllers/todo-command-controller.ts:474). Missing attribution
+ *  counts as agent, because that is the default the same normalizer applies,
+ *  and the host tests this identical predicate where it separates human text
+ *  from injected text (src/secrets/message-transform.ts:225).
+ *
+ *  Keyed on attribution, never on the note's wording — a text heuristic would
+ *  break the moment OMP rephrased a prompt. One function for every site that
+ *  folds developer content onto the user role, so the history replay and the
+ *  live prompt cannot frame the same note two different ways. */
+export function frameDeveloperText(message: { attribution?: string }, text: string): string {
+	return message.attribution === "user" ? markDeveloperText(text) : markAgentSteerText(text);
+}
 
 // Pi tool names under Claude Code's builtin names. Only ever correct on the
 // AskClaude path, where CC runs its own tools — see mapPiToolNameToSdk.
@@ -100,7 +213,7 @@ export type DroppedContent = {
 
 /** Convert pi message array to Anthropic API format. */
 export function convertPiMessages(
-	messages: PiMessage[],
+	messages: HostMessage[],
 	customToolNameToSdk?: Map<string, string>,
 ): { anthropicMessages: SessionMessage[]; sanitizedIds: Map<string, string>; dropped: DroppedContent } {
 	const anthropicMessages = [];
@@ -116,12 +229,33 @@ export function convertPiMessages(
 	let turnAssistantIdx: number | null = null;
 
 	for (const msg of messages) {
-		if (msg.role === "user") {
+		if (isPromptBearing(msg)) {
+			// A `developer` message rides the user role *and the user code path*,
+			// deliberately. Anthropic has no developer role, and the tool-result
+			// splice below hoists a turn's results above any user-role message
+			// sitting between the assistant message and them — which is exactly
+			// what a developer note injected mid-turn (plan-mode reminder, rewind
+			// warning) is. Give it its own branch and it stops being hoisted over,
+			// so it takes the pairing slot repairToolPairing hands to the first
+			// user message after an assistant turn and strands every real result
+			// behind it. Only the text differs, and only by its tag.
+			const isDeveloper = msg.role === "developer";
 			if (typeof msg.content === "string") {
-				anthropicMessages.push({ role: "user", content: msg.content || "[empty]" });
+				const text = isDeveloper && msg.content ? frameDeveloperText(msg, msg.content) : msg.content;
+				anthropicMessages.push({ role: "user", content: text || "[empty]" });
 			} else if (Array.isArray(msg.content)) {
 				const parts = [];
+				// The tag brackets the whole note, so a developer message's text folds
+				// into one block rather than being tagged fragment by fragment. Nothing
+				// is reordered against images in practice: the host puts a developer
+				// message's images on a separate user message (pi-coding-agent
+				// src/session/messages.ts, convertImageBearingCustomMessage).
+				if (isDeveloper) {
+					const text = messageContentToText(msg.content);
+					if (text) parts.push({ type: "text", text: frameDeveloperText(msg, text) });
+				}
 				for (const block of msg.content) {
+					if (isDeveloper && block.type === "text") continue; // already folded above
 					if (block.type === "text" && block.text) parts.push({ type: "text", text: block.text });
 					else if (block.type === "image" && block.data && block.mimeType) {
 						parts.push({ type: "image", source: { type: "base64", media_type: block.mimeType, data: block.data } });

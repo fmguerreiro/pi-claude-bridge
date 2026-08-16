@@ -3,7 +3,7 @@ import * as piAi from "@earendil-works/pi-ai";
 import { getModels } from "@earendil-works/pi-ai/compat";
 import * as codingAgent from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
-import type { BranchSummaryResult, CompactionEntry, ExtensionAPI, ExtensionContext, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
+import type { BranchSummaryResult, CompactionEntry, ExtensionAPI, ExtensionContext, ExtensionUIContext, ProviderConfig } from "@earendil-works/pi-coding-agent";
 import { query, type EffortLevel, type SDKMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
 import type { Base64ImageSource, ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { Text } from "@earendil-works/pi-tui";
@@ -200,21 +200,42 @@ function diagDump(label: string, data: Record<string, unknown>) {
 
 // --- Constants ---
 
-// Global key to prevent re-registration of the provider across module reloads.
+// Global pin for the provider's streamSimple, shared across module evaluations.
 //
-// Extensions like pi-subagents spawn a subagent and it loads this module
-// again. Without this guard, the subagent's call to registerProvider() would
-// overwrite the parent's `streamSimple` function reference in the shared
-// ModelRegistry. When the parent later delivers a tool result, it would call
-// the subagent's `streamSimple` (which has empty state) instead of its own.
+// A subagent runs in a fresh child session that loads this module again, so a
+// second instance reaches the registration below. Its own `streamSimple` closes
+// over empty state: if that landed in the host's provider entry, the parent's
+// next tool-result delivery would call the child's function instead of its own
+// and the turn would stall. So the FIRST instance to get here pins its function
+// in a Symbol.for() global (shared across all module instances) and every later
+// instance registers *that* pinned function instead of its own. A child's turns
+// then run as reentrant QueryContexts inside the pinned instance, which is what
+// streamClaudeAgentSdk's isReentrant path and promptCaptures already assume.
 //
-// By storing the active streamSimple in a Symbol.for() global (shared across all
-// module instances), we ensure only the FIRST instance to register takes effect.
-// Subsequent instances wrap the stored function instead of overwriting it.
+// Later instances must still call registerProvider(). Skipping it is what broke
+// subagents under OMP: createAgentSession clears every registration owned by an
+// active extension source and then re-applies only that session's queued ones
+// (pi-coding-agent/src/sdk.ts:2039-2051 → ModelRegistry.clearSourceRegistrations,
+// which calls unregisterCustomApis(sourceId) and, via #clearRuntimeProviderState,
+// authStorage.removeConfigApiKey(provider)). With nothing queued, the child
+// session — and the parent, which shares the registry — lost both the
+// `claude-bridge` api and its apiKey, and the next stream failed with
+// "No API key for provider: claude-bridge". Pi never clears, and its
+// ModelRuntime.registerProvider merges defined values over the previous
+// registration, so re-registering the pinned function is a no-op merge there.
 //
-// On session_shutdown (including /reload), clearSession() resets this so a fresh
-// registration can occur for the next session.
+// On session_shutdown (including /reload), clearSession() releases the pin — but
+// only if this instance owns it — so a fresh registration can occur next session.
 const ACTIVE_STREAM_SIMPLE_KEY = Symbol.for("claude-bridge:activeStreamSimple");
+
+/** Resolve the streamSimple to register: the pinned one if some instance already
+ *  claimed it, otherwise `own`, which becomes the pin. */
+function pinStreamSimple<T>(globals: Record<symbol, unknown>, own: T): T {
+	const pinned = globals[ACTIVE_STREAM_SIMPLE_KEY] as T | undefined;
+	if (pinned) return pinned;
+	globals[ACTIVE_STREAM_SIMPLE_KEY] = own;
+	return own;
+}
 
 // Claude Code's own builtin tools, for the AskClaude path where CC really runs
 // them. The provider path never sees these — it starts CC with `tools: []`.
@@ -929,6 +950,8 @@ export const __test = {
 	buildMcpServers,
 	mcpAllowedTools,
 	branchSummaryOutcome,
+	pinStreamSimple,
+	ACTIVE_STREAM_SIMPLE_KEY,
 };
 
 // --- Provider helpers: tool name mapping ---
@@ -2425,10 +2448,9 @@ export default function (pi: ExtensionAPI) {
 		debug(`${event}: clearing session ${sharedSession?.sessionId?.slice(0, 8) ?? "none"}`);
 		sharedSession = null;
 
-		// Clear the global streamSimple if this instance registered it.
-		// This allows /reload to work — the old instance clears the flag so
-		// the new instance can register fresh without wrapping stale state.
-		const g = globalThis as Record<symbol, any>;
+		// Release the pin if this instance owns it, so /reload lets the next
+		// instance pin its own streamSimple instead of inheriting stale state.
+		const g = globalThis as Record<symbol, unknown>;
 		if (g[ACTIVE_STREAM_SIMPLE_KEY] === streamClaudeAgentSdk) {
 			debug(`${event}: clearing ACTIVE_STREAM_SIMPLE_KEY`);
 			g[ACTIVE_STREAM_SIMPLE_KEY] = undefined;
@@ -2561,30 +2583,23 @@ export default function (pi: ExtensionAPI) {
 
 	// --- Provider ---
 	//
-	// Guard against re-registration when the module is loaded multiple times
-	// (e.g., when spawning subagents). The shared ModelRegistry would otherwise
-	// overwrite the parent's streamSimple, breaking tool result delivery.
+	// Registered by every module instance, always with the pinned streamSimple.
+	// Registration is not optional for a later instance: the host may have just
+	// cleared this extension's provider entry (OMP does, once per session), and
+	// the entry carries the api and the apiKey the model resolves through. The pin
+	// is what keeps a child instance from taking the parent's place in it.
 	// See ACTIVE_STREAM_SIMPLE_KEY for the full mechanism.
 
-	const g = globalThis as Record<symbol, any>;
-	if (!g[ACTIVE_STREAM_SIMPLE_KEY]) {
-		// First instance: store our streamSimple and register.
-		g[ACTIVE_STREAM_SIMPLE_KEY] = streamClaudeAgentSdk;
-		pi.registerProvider(PROVIDER_ID, {
-			baseUrl: "claude-bridge",
-			apiKey: "not-used",
-			api: "claude-bridge",
-			models: registeredModels,
-			// Cast: pi-ai AssistantMessageEventStream diamond dep between pi-coding-agent and pi-agent-core
-			streamSimple: streamClaudeAgentSdk as any,
-		});
-	} else {
-		// Subsequent instance (subagent session): skip registration entirely.
-		// The subagent already has access to claude-bridge models via the shared
-		// ModelRegistry from the parent's registration. Calls to those models
-		// route through the parent's streamSimple via reentrant QueryContexts.
-		debug(`provider: skipping re-registration, parent instance active (module=${moduleInstanceId})`);
-	}
+	const pinnedStreamSimple = pinStreamSimple(globalThis as Record<symbol, unknown>, streamClaudeAgentSdk);
+	debug(`provider: registering with ${pinnedStreamSimple === streamClaudeAgentSdk ? "own" : "pinned parent"} streamSimple (module=${moduleInstanceId})`);
+	pi.registerProvider(PROVIDER_ID, {
+		baseUrl: "claude-bridge",
+		apiKey: "not-used",
+		api: "claude-bridge",
+		models: registeredModels,
+		// Cast: pi-ai AssistantMessageEventStream diamond dep between pi-coding-agent and pi-agent-core
+		streamSimple: pinnedStreamSimple as unknown as ProviderConfig["streamSimple"],
+	});
 
 	// --- AskClaude tool ---
 

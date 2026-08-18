@@ -20,12 +20,15 @@
     "node": ">=20"
   },
   "files": [
+    "dist",
     "src",
     "README.md",
     "LICENSE",
     "assets"
   ],
   "scripts": {
+    "build": "bun build ./src/index.ts --target=bun --outfile dist/index.js --external '@earendil-works/*' --external typebox --external @sinclair/typebox",
+    "prepare": "bun run build",
     "test:unit": "node --import tsx --import ./tests/lib/setup.mjs --test tests/unit-*.mjs",
     "test": "set -a && [ -f .env.test ] && . .env.test; set +a && npm run test:unit && tests/int-smoke.sh && tests/int-multi-turn.sh && tests/int-cache.sh && node --import tsx --test tests/int-*.mjs",
     "test:usage": "tests/usage-test.sh",
@@ -56,12 +59,12 @@
   },
   "pi": {
     "extensions": [
-      "./src/index.ts"
+      "./dist/index.js"
     ]
   },
   "omp": {
     "extensions": [
-      "./src/index.ts"
+      "./dist/index.js"
     ]
   }
 }

@@ -802,9 +802,46 @@ function syncSharedSession(
 	// reentrant call may take the clean-start-and-preserve branch below: on a user
 	// turn that combination is always the stale-cursor bug of issue #55, never the
 	// subagent-isolation guard the branch exists for.
-	options?: { reentrant?: boolean },
+	//
+	// foreignConversation: this call's system prompt is a pass-through that shares
+	// no substantial prefix with anything this bridge recorded (see
+	// `sharesSubstantialPrefix` in prompt-capture.ts) — an OMP side-agent query
+	// (advisor, title generator, idle recap) that fires after the main turn already
+	// settled, with isReentrant false, so it would otherwise fall through to the
+	// REBUILD path below and steal the main conversation's `sharedSession`. See the
+	// early branch immediately below.
+	options?: { reentrant?: boolean; foreignConversation?: boolean },
 ): SyncResult {
 	const priorMessages = messages.slice(0, turnStart(messages)); // everything before the current user turn
+
+	// FOREIGN CONVERSATION path
+	//
+	// A side-agent query is never reentrant (activeContexts=0 by the time it runs)
+	// so it cannot take the reentrant clean-start-and-preserve branch below, and its
+	// own prompt never matches `sharedSession`'s conversation. Left to fall through,
+	// it hit REBUILD, overwrote `sharedSession` with its own session id and cursor,
+	// and fired the "no conversation history" notify meant for a real user turn —
+	// then a later side-agent turn deleted whatever session id it found there. This
+	// branch keeps the side agent's own history import (so it still gets its own
+	// context) but never touches `sharedSession` or the main conversation's id.
+	if (options?.foreignConversation) {
+		if (priorMessages.length === 0) {
+			debug("Case foreign: clean start, no priors, shared session left untouched");
+			debug("syncResult: path=foreign-clean-start preserve-shared");
+			return { sessionId: null, preserveSharedSession: true };
+		}
+		const session = createSession({
+			projectPath: cwd,
+			claudeDir: process.env.CLAUDE_CONFIG_DIR,
+			...(modelId ? { model: modelId } : {}),
+		});
+		convertAndImportMessages(session, priorMessages, customToolNameToSdk, []);
+		session.save();
+		verifyWrittenSession(session.jsonlPath, session.sessionId, session.records.length, cwd);
+		debug(`Case foreign: imported ${priorMessages.length} priors into fresh session ${session.sessionId.slice(0, 8)}, shared session untouched`);
+		debug(`syncResult: path=foreign-import sessionId=${session.sessionId} preserve-shared`);
+		return { sessionId: session.sessionId, preserveSharedSession: true };
+	}
 
 	// REUSE path
 	//
@@ -1985,6 +2022,10 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// still passes through losslessly — see resolveOrDerive in prompt-capture.ts.
 	const promptCapture = promptCaptures.resolveOrDerive(normalizeSystemPrompt(context.systemPrompt));
 	warnOnRewrittenPromptPassthrough(promptCapture);
+	// A pass-through capture that shares no substantial prefix with anything this
+	// bridge recorded is a different conversation, not a rewrite of this one — see
+	// `sharesSubstantialPrefix` in prompt-capture.ts.
+	const foreignConversation = promptCapture?.sharesSubstantialPrefix === false;
 	const systemPromptAppend = promptCapture
 		? projectPromptCapture(promptCapture, {
 			skillReadTool: mcpTools.some((tool) => tool.name === "read") ? "mcp" : "none",
@@ -2011,7 +2052,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// will actually be given, or a >200K conversation rebuilt on the bare id later
 	// fails with "Prompt is too long" (issue #42). reentrant tells sync whether a
 	// context shorter than the cursor is subagent isolation or lost history.
-	const syncResult = syncSharedSession(context.messages, cwd, customToolNameToSdk, cliModel, { reentrant: isReentrant });
+	const syncResult = syncSharedSession(context.messages, cwd, customToolNameToSdk, cliModel, { reentrant: isReentrant, foreignConversation });
 	const { sessionId: resumeSessionId } = syncResult;
 	const promptBlocks = extractUserPromptBlocks(context.messages);
 	let promptText = extractUserPrompt(context.messages) ?? "";

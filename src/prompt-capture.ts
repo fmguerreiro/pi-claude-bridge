@@ -24,6 +24,16 @@ export type PromptCapture = PromptCaptureInput & {
 	inherited: InheritedPrompt[];
 	/**
 	 * Set only on a pass-through capture (see `resolveOrDerive`): whether the
+	 * unaccountable prompt shares a substantial leading prefix with a capture
+	 * this registry already knows about. True means the pass-through is most
+	 * likely the same conversation whose prompt got reassembled mid-turn —
+	 * false means it is a different conversation this registry never recorded
+	 * (OMP's advisor, title generator, idle recap). `undefined` for every
+	 * capture reached by `record`, revival or embedding.
+	 */
+	sharesSubstantialPrefix?: boolean;
+	/**
+	 * Set only on a pass-through capture (see `resolveOrDerive`): whether the
 	 * unaccountable prompt shares a substantial prefix with a capture this
 	 * registry already knows about. `undefined` for every capture reached by
 	 * `record`, revival or embedding.
@@ -211,14 +221,15 @@ export class PromptCaptures {
 				bestMatch = capture;
 			}
 		}
-		const rewroteKnownCapture =
-			bestMatch !== undefined && bestPrefixLength >= SUBSTANTIAL_PREFIX_LENGTH && hasPortableStructure(bestMatch);
+		const sharesSubstantialPrefix = bestMatch !== undefined && bestPrefixLength >= SUBSTANTIAL_PREFIX_LENGTH;
+		const rewroteKnownCapture = bestMatch !== undefined && sharesSubstantialPrefix && hasPortableStructure(bestMatch);
 		return {
 			assembledPrompt: systemPrompt,
 			custom: systemPrompt,
 			contextFiles: [],
 			skills: [],
 			inherited: [],
+			sharesSubstantialPrefix,
 			passthroughRisk: rewroteKnownCapture ? "loud" : "quiet",
 		};
 	}

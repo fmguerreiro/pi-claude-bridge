@@ -213,6 +213,35 @@ describe("PromptCaptures", () => {
 		assert.equal(captures.resolveOrDerive(rewrittenMidBody).passthroughRisk, "loud");
 	});
 
+	it("marks sharesSubstantialPrefix false for a self-contained pass-through prompt", () => {
+		const captures = new PromptCaptures();
+		captures.record(PARENT_KEY, capture({ contextFiles: [{ path: "/AGENTS.md", content: "parent rules" }] }));
+
+		const passthrough = captures.resolveOrDerive("a prompt sharing nothing with what we recorded");
+		assert.equal(passthrough.sharesSubstantialPrefix, false, "an unrelated prompt is a different conversation, not a rewrite of this one");
+	});
+
+	it("marks sharesSubstantialPrefix true for a prompt rewritten mid-body past the threshold", () => {
+		const captures = new PromptCaptures();
+		const longKnown = "L".repeat(SUBSTANTIAL_PREFIX_LENGTH + 400);
+		captures.record(longKnown, capture({ custom: longKnown, contextFiles: [{ path: "/AGENTS.md", content: "parent rules" }] }));
+
+		const rewrittenMidBody = `${longKnown.slice(0, SUBSTANTIAL_PREFIX_LENGTH + 200)}<memories>injected</memories>${longKnown.slice(SUBSTANTIAL_PREFIX_LENGTH + 200)}`;
+		const passthrough = captures.resolveOrDerive(rewrittenMidBody);
+		assert.equal(passthrough.sharesSubstantialPrefix, true, "a substantial shared prefix means the same conversation, prompt rebuilt mid-turn");
+		// The prefix match is independent of whether the matched capture carries portable
+		// structure — that only decides passthroughRisk, not sharesSubstantialPrefix.
+		assert.equal(passthrough.passthroughRisk, "loud");
+	});
+
+	it("leaves sharesSubstantialPrefix undefined for a normally recorded capture", () => {
+		const captures = new PromptCaptures();
+		captures.record(PARENT_KEY, capture({ contextFiles: [{ path: "/AGENTS.md", content: "parent rules" }] }));
+
+		assert.equal(captures.resolve(PARENT_KEY).sharesSubstantialPrefix, undefined);
+		assert.equal(captures.resolveOrDerive(PARENT_KEY).sharesSubstantialPrefix, undefined, "revival must not set a pass-through-only field");
+	});
+
 	it("recursively projects an inherited prompt without Pi's harness", () => {
 		const browser = skill("browser");
 		const captures = new PromptCaptures();

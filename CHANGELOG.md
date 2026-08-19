@@ -2,6 +2,11 @@
 
 ## UNRELEASED
 
+- **Fix: make OMP-hosted tools dispatch under managed Claude settings** — tools served through the bridge are declared in `allowedTools`, so disabling bypass mode no longer denies them before their MCP handlers run.
+- **Fix: preserve OMP developer messages** — user-attributed context and agent steering now remain distinct, and a trailing developer message no longer produces a bogus `[continue]` turn.
+- **Fix: keep OMP logs under the active agent directory** — debug and CLI logs now honor profiles, `PI_CODING_AGENT_DIR`, and `CLAUDE_BRIDGE_DEBUG_PATH`.
+- **Fix: register the bridge provider in every OMP session** — later module instances reuse the first instance's pinned stream function while restoring the provider API and key that OMP clears during session initialization.
+
 - **Fix: better isolate AskClaude tool (issue #59)** — AskClaude children no longer inherit the user's `~/.claude` `CLAUDE.md` files or skill listing, and now always get Claude Code's system prompt preset instead of only when pi-side skills exist. Thanks @JAtkinsonKO.
 - **Fix: Bogus debug message about "record count mismatch" after switching providers** — the post-rebuild integrity check did not take `@file` expansion into account when switching providers.
 

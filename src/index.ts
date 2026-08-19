@@ -2,16 +2,16 @@ import { calculateCost, StringEnum, type AssistantMessage, type AssistantMessage
 import * as piAi from "@earendil-works/pi-ai";
 import { getModels } from "@earendil-works/pi-ai/compat";
 import * as codingAgent from "@earendil-works/pi-coding-agent";
-import type { BranchSummaryResult, CompactionEntry, ExtensionAPI, ExtensionContext, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import type { BranchSummaryResult, CompactionEntry, ExtensionAPI, ExtensionContext, ExtensionUIContext, ProviderConfig } from "@earendil-works/pi-coding-agent";
 import { query, type EffortLevel, type SDKMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
 import type { Base64ImageSource, ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { Type } from "typebox";
 import { Text } from "@earendil-works/pi-tui";
 import { createSession, deleteSession, openSession, repairToolPairing } from "cc-session-io";
 import { appendFileSync, mkdirSync, realpathSync, statSync } from "fs";
-import { homedir } from "os";
 import { dirname, join } from "path";
-import { PROVIDER_ID, messageContentToText, convertPiMessages } from "./convert.js";
+import { PROVIDER_ID, isPromptBearing, frameDeveloperText, messageContentToText, convertPiMessages, type DeveloperMessage, type HostMessage } from "./convert.js";
 import { applyLongContext, buildModels, claudeCodeModelId, type LongContextSettings, resolveModel as _resolveModel } from "./models.js";
 import { MCP_SERVER_NAME, MCP_TOOL_PREFIX, renderSkillsBlock } from "./skills.js";
 import { verifyWrittenSession as _verifyWrittenSession } from "./session-verify.js";
@@ -77,11 +77,11 @@ const newAssistantMessageEventStream: () => AssistantMessageEventStream =
 		: () => new _piAi.AssistantMessageEventStream();
 
 // --- Debug logging ---
-// CLAUDE_BRIDGE_DEBUG=1 enables debug logging to ~/.pi/agent/claude-bridge.log
-
+// Keep every bridge log under the active host's agent directory. The explicit
+// debug path relocates the diagnostic and CLI logs with it.
 const DEBUG = process.env.CLAUDE_BRIDGE_DEBUG === "1";
-const DEBUG_LOG_PATH = process.env.CLAUDE_BRIDGE_DEBUG_PATH || join(homedir(), ".pi", "agent", "claude-bridge.log");
-const DIAG_LOG_PATH = join(homedir(), ".pi", "agent", "claude-bridge-diag.log");
+const DEBUG_LOG_PATH = process.env.CLAUDE_BRIDGE_DEBUG_PATH || join(getAgentDir(), "claude-bridge.log");
+const DIAG_LOG_PATH = join(dirname(DEBUG_LOG_PATH), "claude-bridge-diag.log");
 
 // CLAUDE_BRIDGE_RECORD_STREAM=<path> appends every SDK message consumeQuery sees,
 // one JSON object per line. Used by tests/lib/record-sdk-streams.mjs to capture
@@ -115,14 +115,11 @@ const CC_CHILD_ENV = {
 // while rules need their own. Managed/policy memory is not excludable by design.
 const CLAUDE_MD_EXCLUDES = ["**/CLAUDE.md", "**/.claude/rules/**"];
 
-// Ensure log directories exist when debug is enabled
-if (DEBUG) {
-	try {
-		mkdirSync(dirname(DEBUG_LOG_PATH), { recursive: true });
-		mkdirSync(dirname(DIAG_LOG_PATH), { recursive: true });
-	} catch {
-		// If directory creation fails, debug functions will throw on first use
-	}
+// diagDump writes even when debug logging is disabled.
+try {
+	mkdirSync(dirname(DEBUG_LOG_PATH), { recursive: true });
+} catch {
+	// Log writes report the real failure on first use.
 }
 
 // Unique per module evaluation — confirms whether subagents share module state
@@ -176,21 +173,17 @@ function diagDump(label: string, data: Record<string, unknown>) {
 
 // --- Constants ---
 
-// Global key to prevent re-registration of the provider across module reloads.
-//
-// Extensions like pi-subagents spawn a subagent and it loads this module
-// again. Without this guard, the subagent's call to registerProvider() would
-// overwrite the parent's `streamSimple` function reference in the shared
-// ModelRegistry. When the parent later delivers a tool result, it would call
-// the subagent's `streamSimple` (which has empty state) instead of its own.
-//
-// By storing the active streamSimple in a Symbol.for() global (shared across all
-// module instances), we ensure only the FIRST instance to register takes effect.
-// Subsequent instances wrap the stored function instead of overwriting it.
-//
-// On session_shutdown (including /reload), clearSession() resets this so a fresh
-// registration can occur for the next session.
+// The first module instance owns the provider stream state. Every later module
+// instance must still register the provider, but with this pinned function, so
+// OMP can rebuild its provider registry without replacing the parent's stream.
 const ACTIVE_STREAM_SIMPLE_KEY = Symbol.for("claude-bridge:activeStreamSimple");
+
+function pinStreamSimple<T>(globals: Record<symbol, unknown>, own: T): T {
+	const pinned = globals[ACTIVE_STREAM_SIMPLE_KEY] as T | undefined;
+	if (pinned) return pinned;
+	globals[ACTIVE_STREAM_SIMPLE_KEY] = own;
+	return own;
+}
 
 // Claude Code's own builtin tools, for the AskClaude path where CC really runs
 // them. The provider path never sees these — it starts CC with `tools: []`.
@@ -362,37 +355,28 @@ function extractAllToolResults(context: Context): McpResult[] {
 	return results;
 }
 
-/** Index of the first message of the current user turn — the trailing run of
- *  user messages that has not been written into the Claude Code session yet.
- *  Equals messages.length when the last message is not a user message.
- *
- *  Single source of truth for the history/prompt split: everything before this
- *  index is replayed as session history, everything from it onward becomes the
- *  prompt. Deriving both halves from one index is what keeps a message from
- *  landing in both — an extension appending a display-only user message after
- *  the real one (see issue #34) makes the turn longer than one message. */
-function turnStart(messages: Context["messages"]): number {
+/** Index of the first prompt-bearing message in the current turn. */
+function turnStart(messages: HostMessage[]): number {
 	let i = messages.length;
-	while (i > 0 && messages[i - 1].role === "user") i--;
+	while (i > 0 && isPromptBearing(messages[i - 1])) i--;
 	return i;
 }
 
-/** Extract the current user turn as a prompt string. Returns null if the last message is not a user message. */
-function extractUserPrompt(messages: Context["messages"]): string | null {
-	const turn = messages.slice(turnStart(messages)) as UserMessage[];
+function extractUserPrompt(messages: HostMessage[]): string | null {
+	const turn = messages.slice(turnStart(messages)) as (UserMessage | DeveloperMessage)[];
 	if (turn.length === 0) return null;
-	// Drop empties before joining so an all-empty turn still yields "" and trips
-	// the caller's empty-prompt guard rather than sending bare newlines.
 	return turn
-		.map((m) => (typeof m.content === "string" ? m.content : messageContentToText(m.content)))
+		.map((message) => {
+			const text = typeof message.content === "string" ? message.content : messageContentToText(message.content);
+			return text && message.role === "developer" ? frameDeveloperText(message, text) : text;
+		})
 		.filter((text) => text)
 		.join("\n");
 }
 
-/** Extract the current user turn as ContentBlockParam[] (preserving images).
- *  Returns null if no images — caller should fall back to string prompt. */
-function extractUserPromptBlocks(messages: Context["messages"]): ContentBlockParam[] | null {
-	const turn = messages.slice(turnStart(messages)) as UserMessage[];
+/** Extract the current turn as content blocks while preserving images. */
+function extractUserPromptBlocks(messages: HostMessage[]): ContentBlockParam[] | null {
+	const turn = messages.slice(turnStart(messages)) as (UserMessage | DeveloperMessage)[];
 	if (turn.length === 0) return null;
 
 	let hasImage = false;
@@ -401,21 +385,19 @@ function extractUserPromptBlocks(messages: Context["messages"]): ContentBlockPar
 		const content: (TextContent | ImageContent)[] = typeof message.content === "string"
 			? [{ type: "text", text: message.content }]
 			: message.content;
-		// Off-type content violates UserMessage's contract, so fail rather than
-		// degrade — but name the shape, since the cause is almost always another
-		// extension appending a malformed message, not this file.
 		if (!Array.isArray(content)) {
 			throw new Error(
 				`extractUserPromptBlocks: user message content must be a string or block array, got ${typeof content} — likely a malformed message from another extension`,
 			);
 		}
+		if (message.role === "developer") {
+			const text = messageContentToText(content);
+			if (text) blocks.push({ type: "text", text: frameDeveloperText(message, text) });
+		}
 		for (const block of content) {
-			if (block.type === "text" && block.text) {
+			if (block.type === "text" && message.role !== "developer" && block.text) {
 				blocks.push({ type: "text", text: block.text });
 			} else if (block.type === "image") {
-				// Guard before logging: data-less image blocks do occur, and reading
-				// .length off the missing field in the debug template would throw
-				// before this check ever runs (template args evaluate unconditionally).
 				if (!block.data || !block.mimeType) {
 					debug(`image block missing data or mimeType, skipping: keys=${Object.keys(block).join(",")}`);
 					continue;
@@ -433,7 +415,7 @@ function extractUserPromptBlocks(messages: Context["messages"]): ContentBlockPar
 			}
 		}
 	}
-	debug(`extractUserPromptBlocks: ${turn.length} msgs in turn, ${blocks.length} blocks, types=${blocks.map((b) => b.type).join(",")}`);
+	debug(`extractUserPromptBlocks: ${turn.length} msgs in turn, ${blocks.length} blocks, types=${blocks.map((block) => block.type).join(",")}`);
 	return hasImage ? blocks : null;
 }
 
@@ -780,6 +762,9 @@ export const __test = {
 		piUI = ui;
 	},
 	syncSharedSession,
+	extractUserPrompt,
+	turnStart,
+	logPaths: { debug: DEBUG_LOG_PATH, diag: DIAG_LOG_PATH },
 	extractUserPromptBlocks,
 	consumeQuery,
 	finalizeCurrentStream,
@@ -788,6 +773,9 @@ export const __test = {
 	drainForAbort,
 	CC_CHILD_ENV,
 	buildMcpServers,
+	mcpAllowedTools,
+	pinStreamSimple,
+	ACTIVE_STREAM_SIMPLE_KEY,
 	branchSummaryOutcome,
 };
 
@@ -982,6 +970,10 @@ function buildMcpServers(tools: Tool[], queryCtx: QueryContext): Record<string, 
 		},
 	}));
 	return { [MCP_SERVER_NAME]: createToolServer(MCP_SERVER_NAME, mcpTools) };
+}
+
+function mcpAllowedTools(tools: readonly Tool[]): string[] {
+	return tools.map((tool) => `${MCP_TOOL_PREFIX}${tool.name}`);
 }
 
 // --- Usage helpers ---
@@ -1633,6 +1625,9 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		env: childEnv,
 		tools: [],
 		permissionMode: "bypassPermissions",
+		// Managed settings can demote bypassPermissions. Explicit rules keep the
+		// bridge's served tools dispatchable without granting any extra tool.
+		allowedTools: mcpAllowedTools(mcpTools),
 		includePartialMessages: true,
 		settings: { ...claudeCodeSettings(providerSettings), claudeMdExcludes: CLAUDE_MD_EXCLUDES },
 		...(settingSources ? { settingSources } : {}),
@@ -1991,10 +1986,7 @@ export default function (pi: ExtensionAPI) {
 		debug(`${event}: clearing session ${sharedSession?.sessionId?.slice(0, 8) ?? "none"}`);
 		sharedSession = null;
 
-		// Clear the global streamSimple if this instance registered it.
-		// This allows /reload to work — the old instance clears the flag so
-		// the new instance can register fresh without wrapping stale state.
-		const g = globalThis as Record<symbol, any>;
+		const g = globalThis as Record<symbol, unknown>;
 		if (g[ACTIVE_STREAM_SIMPLE_KEY] === streamClaudeAgentSdk) {
 			debug(`${event}: clearing ACTIVE_STREAM_SIMPLE_KEY`);
 			g[ACTIVE_STREAM_SIMPLE_KEY] = undefined;
@@ -2130,32 +2122,16 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 
-	// --- Provider ---
-	//
-	// Guard against re-registration when the module is loaded multiple times
-	// (e.g., when spawning subagents). The shared ModelRegistry would otherwise
-	// overwrite the parent's streamSimple, breaking tool result delivery.
-	// See ACTIVE_STREAM_SIMPLE_KEY for the full mechanism.
-
-	const g = globalThis as Record<symbol, any>;
-	if (!g[ACTIVE_STREAM_SIMPLE_KEY]) {
-		// First instance: store our streamSimple and register.
-		g[ACTIVE_STREAM_SIMPLE_KEY] = streamClaudeAgentSdk;
-		pi.registerProvider(PROVIDER_ID, {
-			baseUrl: "claude-bridge",
-			apiKey: "not-used",
-			api: "claude-bridge",
-			models: registeredModels,
-			// Cast: pi-ai AssistantMessageEventStream diamond dep between pi-coding-agent and pi-agent-core
-			streamSimple: streamClaudeAgentSdk as any,
-		});
-	} else {
-		// Subsequent instance (subagent session): skip registration entirely.
-		// The subagent already has access to claude-bridge models via the shared
-		// ModelRegistry from the parent's registration. Calls to those models
-		// route through the parent's streamSimple via reentrant QueryContexts.
-		debug(`provider: skipping re-registration, parent instance active (module=${moduleInstanceId})`);
-	}
+	// Every module instance must restore OMP's per-session provider registry.
+	// Register the parent's pinned stream so a child cannot replace its state.
+	const pinnedStreamSimple = pinStreamSimple(globalThis as Record<symbol, unknown>, streamClaudeAgentSdk);
+	pi.registerProvider(PROVIDER_ID, {
+		baseUrl: "claude-bridge",
+		apiKey: "not-used",
+		api: "claude-bridge",
+		models: registeredModels,
+		streamSimple: pinnedStreamSimple as unknown as ProviderConfig["streamSimple"],
+	});
 
 	// --- AskClaude tool ---
 

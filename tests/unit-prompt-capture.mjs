@@ -136,7 +136,7 @@ describe("PromptCaptures", () => {
 		assert.equal(passthrough.passthroughRisk, "quiet");
 	});
 
-	it("classifies a pass-through prompt as loud once its shared prefix with a known capture meets the threshold", () => {
+	it("classifies a pass-through prompt as loud once its shared prefix with a known capture meets the threshold, when that capture has a narrower custom", () => {
 		const captures = new PromptCaptures();
 		const longKnown = "L".repeat(SUBSTANTIAL_PREFIX_LENGTH + 400);
 		captures.record(longKnown, capture());
@@ -158,6 +158,59 @@ describe("PromptCaptures", () => {
 
 		const shortOverlap = `${longKnown.slice(0, 10)}${"Z".repeat(500)}`;
 		assert.equal(captures.resolveOrDerive(shortOverlap).passthroughRisk, "quiet");
+	});
+
+	it("classifies an OMP-shaped pass-through prompt as quiet even past the prefix threshold, because it projects to itself", () => {
+		const captures = new PromptCaptures();
+		const longKnown = "L".repeat(SUBSTANTIAL_PREFIX_LENGTH + 400);
+		// OMP's before_agent_start exposes no systemPromptOptions, so the bridge
+		// always records the whole prompt as `custom` with nothing else set.
+		captures.record(longKnown, capture({ custom: longKnown }));
+
+		const rewrittenMidBody = `${longKnown.slice(0, SUBSTANTIAL_PREFIX_LENGTH + 200)}<memories>injected</memories>${longKnown.slice(SUBSTANTIAL_PREFIX_LENGTH + 200)}`;
+		const passthrough = captures.resolveOrDerive(rewrittenMidBody);
+		assert.equal(passthrough.passthroughRisk, "quiet");
+		assert.equal(
+			projectPromptCapture(passthrough, { skillReadTool: "mcp" }),
+			rewrittenMidBody,
+			"a quiet pass-through still projects byte-identically",
+		);
+	});
+
+	it("classifies a pass-through prompt as loud when its matched capture carries context files", () => {
+		const captures = new PromptCaptures();
+		const longKnown = "L".repeat(SUBSTANTIAL_PREFIX_LENGTH + 400);
+		captures.record(longKnown, capture({ custom: longKnown, contextFiles: [{ path: "/AGENTS.md", content: "parent rules" }] }));
+
+		const rewrittenMidBody = `${longKnown.slice(0, SUBSTANTIAL_PREFIX_LENGTH + 200)}<memories>injected</memories>${longKnown.slice(SUBSTANTIAL_PREFIX_LENGTH + 200)}`;
+		assert.equal(captures.resolveOrDerive(rewrittenMidBody).passthroughRisk, "loud");
+	});
+
+	it("classifies a pass-through prompt as loud when its matched capture carries skills", () => {
+		const captures = new PromptCaptures();
+		const longKnown = "L".repeat(SUBSTANTIAL_PREFIX_LENGTH + 400);
+		captures.record(longKnown, capture({ custom: longKnown, skills: [skill("browser")] }));
+
+		const rewrittenMidBody = `${longKnown.slice(0, SUBSTANTIAL_PREFIX_LENGTH + 200)}<memories>injected</memories>${longKnown.slice(SUBSTANTIAL_PREFIX_LENGTH + 200)}`;
+		assert.equal(captures.resolveOrDerive(rewrittenMidBody).passthroughRisk, "loud");
+	});
+
+	it("classifies a pass-through prompt as loud when its matched capture carries an append", () => {
+		const captures = new PromptCaptures();
+		const longKnown = "L".repeat(SUBSTANTIAL_PREFIX_LENGTH + 400);
+		captures.record(longKnown, capture({ custom: longKnown, append: "extra instructions" }));
+
+		const rewrittenMidBody = `${longKnown.slice(0, SUBSTANTIAL_PREFIX_LENGTH + 200)}<memories>injected</memories>${longKnown.slice(SUBSTANTIAL_PREFIX_LENGTH + 200)}`;
+		assert.equal(captures.resolveOrDerive(rewrittenMidBody).passthroughRisk, "loud");
+	});
+
+	it("classifies a pass-through prompt as loud when its matched capture's custom is narrower than its assembled prompt", () => {
+		const captures = new PromptCaptures();
+		const longKnown = "L".repeat(SUBSTANTIAL_PREFIX_LENGTH + 400);
+		captures.record(longKnown, capture({ custom: "a much shorter custom prompt" }));
+
+		const rewrittenMidBody = `${longKnown.slice(0, SUBSTANTIAL_PREFIX_LENGTH + 200)}<memories>injected</memories>${longKnown.slice(SUBSTANTIAL_PREFIX_LENGTH + 200)}`;
+		assert.equal(captures.resolveOrDerive(rewrittenMidBody).passthroughRisk, "loud");
 	});
 
 	it("recursively projects an inherited prompt without Pi's harness", () => {

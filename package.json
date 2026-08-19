@@ -20,12 +20,15 @@
     "node": ">=20"
   },
   "files": [
+    "dist",
     "src",
     "README.md",
     "LICENSE",
     "assets"
   ],
   "scripts": {
+    "build": "esbuild ./src/index.ts --bundle --platform=node --format=esm --target=node20 --outfile=dist/index.js --external:@earendil-works/* --external:typebox --external:@sinclair/typebox",
+    "prepare": "npm run build",
     "test:unit": "node --import tsx --import ./tests/lib/setup.mjs --test tests/unit-*.mjs",
     "test": "set -a && [ -f .env.test ] && . .env.test; set +a && npm run test:unit && tests/int-smoke.sh && tests/int-multi-turn.sh && tests/int-cache.sh && node --import tsx --test tests/int-*.mjs",
     "test:usage": "tests/usage-test.sh",
@@ -50,18 +53,19 @@
     "@earendil-works/pi-coding-agent": "^0.83.0",
     "@earendil-works/pi-tui": "^0.83.0",
     "@types/node": "^24.13.2",
+    "esbuild": "^0.28.1",
     "tsx": "^4.22.4",
     "typebox": "^1.3.7",
     "typescript": "^6.0.3"
   },
   "pi": {
     "extensions": [
-      "./src/index.ts"
+      "./dist/index.js"
     ]
   },
   "omp": {
     "extensions": [
-      "./src/index.ts"
+      "./dist/index.js"
     ]
   }
 }

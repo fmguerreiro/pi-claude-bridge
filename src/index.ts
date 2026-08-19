@@ -592,12 +592,12 @@ function newAssistantOutput(model: Model<any>, text: string, stopReason: Assista
 function extractIsolatedSummaryPrompt(messages: Context["messages"]): string {
 	if (messages.length !== 1 || messages[0].role !== "user") {
 		throw new Error(
-			`isolatedStreamFn: expected exactly 1 user message, got ${messages.length} ` +
+			`isolatedCompleteFn: expected exactly 1 user message, got ${messages.length} ` +
 			`(${messages.map((m) => m.role).join(",")})`,
 		);
 	}
 	const promptText = extractUserPrompt(messages);
-	if (!promptText) throw new Error("isolatedStreamFn: summarization prompt is empty");
+	if (!promptText) throw new Error("isolatedCompleteFn: summarization prompt is empty");
 	return promptText;
 }
 

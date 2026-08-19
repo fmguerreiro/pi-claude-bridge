@@ -22,7 +22,31 @@ export type PromptCapture = PromptCaptureInput & {
 	assembledPrompt: string;
 	/** Exact previously assembled prompts embedded in `custom`. */
 	inherited: InheritedPrompt[];
+	/**
+	 * Set only on a pass-through capture (see `resolveOrDerive`): whether the
+	 * unaccountable prompt shares a substantial prefix with a capture this
+	 * registry already knows about. `undefined` for every capture reached by
+	 * `record`, revival or embedding.
+	 */
+	passthroughRisk?: "quiet" | "loud";
 };
+
+/** Minimum shared leading characters between an unaccountable prompt and a known
+ *  capture for the match to count as "the same prompt, rewritten" rather than
+ *  coincidence. Measured against this package's actual prompts
+ *  (pi-coding-agent/src/prompts): the main agent prompt and the advisor prompt
+ *  share nothing but the boilerplate `<system-conventions>` preamble, a 90-character
+ *  overlap, despite otherwise being unrelated templates of 14k and 5k characters.
+ *  512 sits comfortably above that measured coincidental overlap and far below any
+ *  prefix a real rewrite of a multi-KB prompt would still share with its original. */
+export const SUBSTANTIAL_PREFIX_LENGTH = 512;
+
+function commonPrefixLength(a: string, b: string): number {
+	const max = Math.min(a.length, b.length);
+	let i = 0;
+	while (i < max && a[i] === b[i]) i++;
+	return i;
+}
 
 /**
  * Captures keyed by the fully assembled prompt pi sends to a provider.
@@ -106,11 +130,25 @@ export class PromptCaptures {
 	 * dropping it would be exactly the silent instruction loss this exists to
 	 * prevent. The descendant is not retained — its key is not ours to own.
 	 *
-	 * Throws when a prompt can be accounted for by neither route. Returning an empty
-	 * capture instead would hand Claude Code a turn with none of the user's context
-	 * files, skills, custom prompt or append text, and say so only in a debug line —
-	 * silently discarding policy the user wrote down. A failed turn is recoverable;
-	 * a turn that quietly ignored its instructions is not.
+	 * Falls through to a pass-through capture when a prompt can be accounted for by
+	 * neither route: OMP's own side-agents (advisor, title generator, idle recap)
+	 * assemble a system prompt without ever routing it through `before_agent_start`,
+	 * so this registry never gets a chance to record it. Losing nothing is what makes
+	 * the fallback safe rather than a silent one: `custom` is set to the whole
+	 * unaccountable prompt and `inherited` is empty, so `projectCapture` renders it
+	 * back out byte-for-byte — the same shape `findInheritedPrompts` already produces
+	 * for the text surrounding an embedded capture above. `contextFiles` and `skills`
+	 * are empty because there is nothing to lose there either: whatever assembled this
+	 * prompt already rendered its own context and skills into the text.
+	 *
+	 * What is lost is provenance, not content — this registry cannot tell "unrelated
+	 * self-contained prompt from a side-agent" apart from "a known capture that got
+	 * rewritten downstream of `before_agent_start`" by construction, since neither
+	 * matches by key. The second case is the one worth losing sleep over: something
+	 * altered a prompt we did record, which is the shape of a real bug — the observed
+	 * 65k-char main-agent failures fit this pattern. `passthroughRisk` on the returned
+	 * capture flags that case for the caller to surface loudly; see
+	 * `SUBSTANTIAL_PREFIX_LENGTH` for how.
 	 */
 	resolveOrDerive(systemPrompt?: string): PromptCapture | undefined {
 		if (!systemPrompt) return undefined;
@@ -123,7 +161,8 @@ export class PromptCaptures {
 		// A capture outlives its lookup key: eviction drops the key while inheritance
 		// edges keep the node alive. findInheritedPrompts deliberately skips a node whose
 		// key *is* the prompt, so without this an evicted exact match would derive
-		// nothing and throw. Touching it puts the key back.
+		// nothing and fall through to the pass-through path below. Touching it puts the
+		// key back.
 		const revived = this.reachableCaptures().find((node) => node.assembledPrompt === systemPrompt);
 		if (revived) {
 			this.touch(systemPrompt, revived);
@@ -131,19 +170,25 @@ export class PromptCaptures {
 		}
 
 		const embedded = this.findInheritedPrompts(systemPrompt, systemPrompt);
-		if (embedded.length === 0) {
-			throw new Error(
-				`prompt-capture: no capture for this ${systemPrompt.length}-char system prompt, and it embeds none of the ${this.captures.size} known. `
-				+ `Claude Code would receive none of this turn's context files, skills or custom instructions. `
-				+ `The usual cause is an extension loaded after claude-bridge that rewrites the system prompt from before_agent_start — `
-				+ `one that wraps it is fine, one that rebuilds or strips it leaves nothing to match.`,
-			);
+		if (embedded.length > 0) {
+			// `custom` is the prompt itself and the edges keep their original offsets, so
+			// projectCustom substitutes the embedded captures in place and preserves every
+			// byte between and around them.
+			return { assembledPrompt: systemPrompt, custom: systemPrompt, contextFiles: [], skills: [], inherited: embedded };
 		}
 
-		// `custom` is the prompt itself and the edges keep their original offsets, so
-		// projectCustom substitutes the embedded captures in place and preserves every
-		// byte between and around them.
-		return { assembledPrompt: systemPrompt, custom: systemPrompt, contextFiles: [], skills: [], inherited: embedded };
+		const reachable = this.reachableCaptures();
+		const rewroteKnownCapture = reachable.some(
+			(capture) => commonPrefixLength(systemPrompt, capture.assembledPrompt) >= SUBSTANTIAL_PREFIX_LENGTH,
+		);
+		return {
+			assembledPrompt: systemPrompt,
+			custom: systemPrompt,
+			contextFiles: [],
+			skills: [],
+			inherited: [],
+			passthroughRisk: rewroteKnownCapture ? "loud" : "quiet",
+		};
 	}
 
 	get size(): number {

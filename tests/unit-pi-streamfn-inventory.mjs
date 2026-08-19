@@ -19,6 +19,14 @@
  * whether it can reach a bridge model, and either handle it (the way
  * `session_before_compact` and `session_before_tree` are taken over) or add it
  * below with a note on why it is harmless.
+ *
+ * What this cannot see: the package below is the one the repo *builds against*,
+ * and the host that loads the bundle may be a different package entirely (OMP
+ * runs `@oh-my-pi/pi-coding-agent` and shims the `@earendil-works` specifier to
+ * it). Green here says nothing about the host's signatures — that is what took
+ * the compaction takeover down when the host moved `streamFn` to `completeImpl`
+ * and dropped its `headers` argument, silently discarding both. The host shape
+ * the takeovers actually call is declared in `HostCodingAgent` in src/index.ts.
  */
 
 import { describe, it } from "node:test";
@@ -39,8 +47,8 @@ const PI_DIST = fileURLToPath(new URL("../node_modules/@earendil-works/pi-coding
 const HANDLED = {
 	"agent-session.js": { mentions: 1, why: "the one hand-off: `streamFn: this.agent.streamFunction` into generateBranchSummary" },
 	"sdk.js": { mentions: 2, why: "constructs the agent, does not summarize" },
-	"compaction/compaction.js": { mentions: 13, why: "taken over via session_before_compact -> isolatedStreamFn" },
-	"compaction/branch-summarization.js": { mentions: 2, why: "taken over via session_before_tree -> isolatedStreamFn" },
+	"compaction/compaction.js": { mentions: 13, why: "taken over via session_before_compact -> isolatedCompleteFn" },
+	"compaction/branch-summarization.js": { mentions: 2, why: "taken over via session_before_tree -> isolatedCompleteFn" },
 };
 
 const mentionsOf = (text) => (text.match(/streamFn/g) ?? []).length;

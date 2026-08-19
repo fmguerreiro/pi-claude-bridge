@@ -7,6 +7,7 @@ import {
 	projectPromptCapture,
 	PromptCaptures,
 	sharedPromptCaptures,
+	SUBSTANTIAL_PREFIX_LENGTH,
 } from "../src/prompt-capture.js";
 
 const PI_HARNESS = "You are an expert coding assistant operating inside pi. Pi documentation: pi packages (docs/packages.md).";
@@ -107,16 +108,56 @@ describe("PromptCaptures", () => {
 		assert.equal(captures.resolve(PARENT_KEY).contextFiles.length, 1);
 	});
 
-	it("throws rather than silently dropping instructions it cannot account for", () => {
+	it("passes an unaccountable prompt through losslessly instead of throwing", () => {
 		const captures = new PromptCaptures();
 		captures.record(PARENT_KEY, capture({ contextFiles: [{ path: "/AGENTS.md", content: "parent rules" }] }));
 
-		assert.throws(
-			() => captures.resolveOrDerive("a prompt sharing nothing with what we recorded"),
-			/no capture for this .* system prompt/,
-		);
+		const unrelated = "a prompt sharing nothing with what we recorded";
+		const passthrough = captures.resolveOrDerive(unrelated);
+		assert.equal(passthrough.assembledPrompt, unrelated);
+		assert.equal(passthrough.custom, unrelated);
+		assert.deepEqual(passthrough.contextFiles, []);
+		assert.deepEqual(passthrough.skills, []);
+		assert.deepEqual(passthrough.inherited, []);
+		assert.equal(captures.resolve(unrelated), undefined, "a pass-through capture is not retained");
+
+		const projected = projectPromptCapture(passthrough, { skillReadTool: "mcp" });
+		assert.equal(projected, unrelated, "projection must be byte-identical to the unaccountable input");
+
 		// No prompt at all is not a loss — there is nothing to forward.
 		assert.equal(captures.resolveOrDerive(undefined), undefined);
+	});
+
+	it("classifies a self-contained pass-through prompt as quiet", () => {
+		const captures = new PromptCaptures();
+		captures.record(PARENT_KEY, capture({ contextFiles: [{ path: "/AGENTS.md", content: "parent rules" }] }));
+
+		const passthrough = captures.resolveOrDerive("a prompt sharing nothing with what we recorded");
+		assert.equal(passthrough.passthroughRisk, "quiet");
+	});
+
+	it("classifies a pass-through prompt as loud once its shared prefix with a known capture meets the threshold", () => {
+		const captures = new PromptCaptures();
+		const longKnown = "L".repeat(SUBSTANTIAL_PREFIX_LENGTH + 400);
+		captures.record(longKnown, capture());
+
+		const atThreshold = `${longKnown.slice(0, SUBSTANTIAL_PREFIX_LENGTH)}${"Z".repeat(500)}`;
+		assert.equal(captures.resolveOrDerive(atThreshold).passthroughRisk, "loud");
+
+		const wellPastThreshold = `${longKnown.slice(0, SUBSTANTIAL_PREFIX_LENGTH + 200)}${"Z".repeat(500)}`;
+		assert.equal(captures.resolveOrDerive(wellPastThreshold).passthroughRisk, "loud");
+	});
+
+	it("classifies a pass-through prompt as quiet when its shared prefix falls short of the threshold", () => {
+		const captures = new PromptCaptures();
+		const longKnown = "L".repeat(SUBSTANTIAL_PREFIX_LENGTH + 400);
+		captures.record(longKnown, capture());
+
+		const justBelowThreshold = `${longKnown.slice(0, SUBSTANTIAL_PREFIX_LENGTH - 1)}${"Z".repeat(500)}`;
+		assert.equal(captures.resolveOrDerive(justBelowThreshold).passthroughRisk, "quiet");
+
+		const shortOverlap = `${longKnown.slice(0, 10)}${"Z".repeat(500)}`;
+		assert.equal(captures.resolveOrDerive(shortOverlap).passthroughRisk, "quiet");
 	});
 
 	it("recursively projects an inherited prompt without Pi's harness", () => {

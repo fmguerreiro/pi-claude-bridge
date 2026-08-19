@@ -21,6 +21,7 @@
 
 - **Fix: better isolate AskClaude tool (issue #59)** — AskClaude children no longer inherit the user's `~/.claude` `CLAUDE.md` files or skill listing, and now always get Claude Code's system prompt preset instead of only when pi-side skills exist. Thanks @JAtkinsonKO.
 - **Fix: Bogus debug message about "record count mismatch" after switching providers** — the post-rebuild integrity check did not take `@file` expansion into account when switching providers.
+- **Fix: OMP's advisor, title generator and idle recap never worked on this provider** — those agents assemble their own system prompt without routing it through `before_agent_start`, so `PromptCaptures.resolveOrDerive` matched neither an exact key nor an embedded one and threw, failing every turn they ran (the advisor halts itself after three). An unaccountable prompt now passes through losslessly instead, projected back out byte-for-byte, since whatever assembled it already rendered its own context files and skills into the text. A prompt that shares a substantial prefix with a capture this bridge did record still means something rewrote it, and that case is reported through `piUI.notify`.
 
 ## 0.7.0 — 2026-08-08
 

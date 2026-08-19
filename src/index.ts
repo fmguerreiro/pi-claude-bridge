@@ -28,6 +28,7 @@ import {
 	collectPromptSkills,
 	projectPromptCapture,
 	sharedPromptCaptures,
+	type PromptCapture,
 	type PromptCaptureInput,
 } from "./prompt-capture.js";
 import { collectCarriedAttachments, placeCarriedAttachments, type CarriedAttachment } from "./attachments.js";
@@ -1040,6 +1041,27 @@ function showStartupNoticeOnce(): void {
 // is keyed rather than held in a single slot, and why the registry is process-global
 // rather than one per module instance.
 const promptCaptures = sharedPromptCaptures();
+// The system prompt of an unaccountable pass-through capture (see
+// `passthroughRisk` on `PromptCapture`) that most recently triggered the warning
+// below. Dedup by content, not a boolean: a "loud" prompt tends to repeat across
+// many turns of the same broken session, and re-notifying every turn would drown
+// out everything else pushed through `piUI.notify`.
+let lastWarnedRewrittenPrompt: string | undefined;
+
+/** Surfaces the one pass-through case worth losing sleep over: a prompt that
+ *  shares a substantial prefix with a capture we recorded from
+ *  `before_agent_start`, meaning something downstream rewrote it rather than
+ *  merely being an unrelated self-contained prompt (see
+ *  `resolveOrDerive` in src/prompt-capture.ts). */
+function warnOnRewrittenPromptPassthrough(capture: PromptCapture | undefined): void {
+	if (capture?.passthroughRisk !== "loud" || capture.assembledPrompt === lastWarnedRewrittenPrompt) return;
+	lastWarnedRewrittenPrompt = capture.assembledPrompt;
+	debug(`prompt-capture: pass-through of a ${capture.assembledPrompt.length}-char system prompt that shares a substantial prefix with a known capture — something rewrote a prompt this bridge recorded`);
+	piUI?.notify(
+		`Claude bridge: a ${capture.assembledPrompt.length}-char system prompt was rewritten after this bridge recorded it; sending it verbatim.`,
+		"warning",
+	);
+}
 
 /** Whatever a settled session left behind, named in one greppable line.
  *
@@ -1951,15 +1973,18 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	const queryCtx = isReentrant ? new QueryContext() : ctx();
 	debug(`provider: fresh query setup, isReentrant=${isReentrant}, activeContexts=${activeQueryContexts.size}`);
 
-	// Resolved first: an unaccountable system prompt throws, and doing that before
-	// anything is claimed or reset leaves no half-built query behind — in particular
-	// no stream claimed on the shared context that nobody will ever end.
+	// Resolved first, before anything is claimed or reset, so a query never gets
+	// half-built ahead of it — in particular no stream claimed on the shared context
+	// that nobody would ever end.
 	const { mcpTools, customToolNameToSdk, customToolNameToPi } = resolveMcpTools(context, askClaudeToolName);
 	// Build from what Pi loaded for this run, so `--no-context-files` and
 	// `--no-skills` reach Claude Code by leaving nothing to forward. A sub-agent's
 	// custom override embeds its parent's assembled Pi prompt; recursive projection
-	// replaces that exact inherited prompt with its already-safe portable parts.
+	// replaces that exact inherited prompt with its already-safe portable parts. A
+	// prompt this bridge never recorded (OMP's advisor, title generator, idle recap)
+	// still passes through losslessly — see resolveOrDerive in prompt-capture.ts.
 	const promptCapture = promptCaptures.resolveOrDerive(normalizeSystemPrompt(context.systemPrompt));
+	warnOnRewrittenPromptPassthrough(promptCapture);
 	const systemPromptAppend = promptCapture
 		? projectPromptCapture(promptCapture, {
 			skillReadTool: mcpTools.some((tool) => tool.name === "read") ? "mcp" : "none",
@@ -2275,15 +2300,18 @@ async function promptAndWait(
 
 	// AskClaude uses Claude Code's native Read tool rather than Pi's MCP bridge.
 	// Same resolver as the provider path: a prompt neither recorded nor derivable
-	// throws here too, rather than silently sending Claude Code no skills.
+	// passes through losslessly here too, same as the provider path — a pass-through
+	// capture carries no skills of its own, which is the correct degrade: whatever
+	// assembled that prompt already rendered its own skills into the text, so
+	// `skillsBlock` below simply comes back undefined rather than an empty block.
 	//
-	// Resolved only when the answer would be used. The throw is justified by what a
-	// miss would cost, so where it costs nothing — skills switched off, or no reader
-	// to open a skill file with — an unrelated miss must not fail the call.
+	// Resolved only when the answer would be used: skills switched off, or no reader
+	// to open a skill file with, means an unrelated pass-through costs nothing.
 	const skillReadTool = disallowedTools.includes("Read") ? "none" : "native";
 	const skillCapture = options?.appendSkills !== false && skillReadTool !== "none"
 		? promptCaptures.resolveOrDerive(normalizeSystemPrompt(options?.systemPrompt))
 		: undefined;
+	warnOnRewrittenPromptPassthrough(skillCapture);
 	const skillsBlock = skillCapture
 		? renderSkillsBlock(collectPromptSkills(skillCapture), skillReadTool)
 		: undefined;

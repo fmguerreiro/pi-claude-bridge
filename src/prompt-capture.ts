@@ -48,6 +48,22 @@ function commonPrefixLength(a: string, b: string): number {
 	return i;
 }
 
+/** Whether projecting `capture` on its own would produce anything beyond its own
+ *  `assembledPrompt` bytes: non-empty context files, non-empty skills, a set
+ *  `append`, or a `custom` narrower than what was assembled (the shape pi's own
+ *  `systemPromptOptions` produces). A capture with none of that — OMP's shape,
+ *  where `custom` is the whole assembled prompt and everything else is empty —
+ *  projects to itself verbatim (see `projectCapture`/`projectCustom`), so matching
+ *  it tells us nothing about whether a rewrite actually lost anything. */
+function hasPortableStructure(capture: PromptCapture): boolean {
+	return (
+		capture.contextFiles.length > 0 ||
+		capture.skills.length > 0 ||
+		capture.append !== undefined ||
+		capture.custom !== capture.assembledPrompt
+	);
+}
+
 /**
  * Captures keyed by the fully assembled prompt pi sends to a provider.
  *
@@ -144,11 +160,19 @@ export class PromptCaptures {
 	 * What is lost is provenance, not content — this registry cannot tell "unrelated
 	 * self-contained prompt from a side-agent" apart from "a known capture that got
 	 * rewritten downstream of `before_agent_start`" by construction, since neither
-	 * matches by key. The second case is the one worth losing sleep over: something
-	 * altered a prompt we did record, which is the shape of a real bug — the observed
-	 * 65k-char main-agent failures fit this pattern. `passthroughRisk` on the returned
-	 * capture flags that case for the caller to surface loudly; see
-	 * `SUBSTANTIAL_PREFIX_LENGTH` for how.
+	 * matches by key. `passthroughRisk` on the returned capture flags the latter for
+	 * the caller to surface loudly, but only when it would actually have mattered:
+	 * the prompt has to share a substantial prefix with a capture we recorded (see
+	 * `SUBSTANTIAL_PREFIX_LENGTH`) *and* that capture has to carry portable structure
+	 * (see `hasPortableStructure`) — context files, skills, an append, or a `custom`
+	 * narrower than its assembled prompt. OMP's own captures never carry that
+	 * structure (its `before_agent_start` exposes no `systemPromptOptions`, so the
+	 * bridge always records the whole prompt as `custom` with nothing else set), so a
+	 * prompt OMP legitimately rebuilds mid-session — on memory promotion, compaction,
+	 * or a tool-registry change — matches by prefix but stays quiet: the pass-through
+	 * is byte-identical to what recording it properly would have produced. Loud is
+	 * reserved for prompts whose matched capture, if it had been recorded fresh,
+	 * would have projected to something other than its own bytes.
 	 */
 	resolveOrDerive(systemPrompt?: string): PromptCapture | undefined {
 		if (!systemPrompt) return undefined;
@@ -178,9 +202,17 @@ export class PromptCaptures {
 		}
 
 		const reachable = this.reachableCaptures();
-		const rewroteKnownCapture = reachable.some(
-			(capture) => commonPrefixLength(systemPrompt, capture.assembledPrompt) >= SUBSTANTIAL_PREFIX_LENGTH,
-		);
+		let bestMatch: PromptCapture | undefined;
+		let bestPrefixLength = 0;
+		for (const capture of reachable) {
+			const prefixLength = commonPrefixLength(systemPrompt, capture.assembledPrompt);
+			if (prefixLength > bestPrefixLength) {
+				bestPrefixLength = prefixLength;
+				bestMatch = capture;
+			}
+		}
+		const rewroteKnownCapture =
+			bestMatch !== undefined && bestPrefixLength >= SUBSTANTIAL_PREFIX_LENGTH && hasPortableStructure(bestMatch);
 		return {
 			assembledPrompt: systemPrompt,
 			custom: systemPrompt,

@@ -3,7 +3,7 @@ import * as piAi from "@earendil-works/pi-ai";
 import { getModels } from "@earendil-works/pi-ai/compat";
 import * as codingAgent from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
-import type { BranchSummaryResult, CompactionEntry, ExtensionAPI, ExtensionContext, ExtensionUIContext, ProviderConfig } from "@earendil-works/pi-coding-agent";
+import type { BranchSummaryResult, CompactionEntry, CompactionResult, ExtensionAPI, ExtensionContext, ExtensionUIContext, GenerateBranchSummaryOptions, ProviderConfig, SessionBeforeCompactEvent, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { query, type EffortLevel, type SDKMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
 import type { Base64ImageSource, ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { Text } from "@earendil-works/pi-tui";
@@ -57,9 +57,27 @@ type HostSessionManager = {
 	buildSessionContext?: () => { messages: Context["messages"] };
 	getBranch: () => Parameters<typeof codingAgent.buildSessionContext>[0];
 };
+// The summarization entry points take a *completion* override, not a stream
+// function, and `compact` takes its instructions/signal directly rather than
+// behind a headers argument. The `@earendil-works` package this builds against
+// still declares the older shape, and it is not the package the host runs, so
+// the live shape is declared here instead of inferred from that declaration.
+// tests/unit-pi-streamfn-inventory.mjs audits that older package, not the host.
+type HostCompleteImpl = (model: Model<any>, context: Context, options?: SimpleStreamOptions) => Promise<AssistantMessage>;
+type HostSummaryOptions = { completeImpl: HostCompleteImpl };
 type HostCodingAgent = {
-	compact?: typeof codingAgent.compact;
-	generateBranchSummary?: typeof codingAgent.generateBranchSummary;
+	compact?: (
+		preparation: SessionBeforeCompactEvent["preparation"],
+		model: Model<any>,
+		apiKey: undefined,
+		customInstructions?: string,
+		signal?: AbortSignal,
+		options?: HostSummaryOptions,
+	) => Promise<CompactionResult>;
+	generateBranchSummary?: (
+		entries: SessionEntry[],
+		options: Omit<GenerateBranchSummaryOptions, "streamFn"> & HostSummaryOptions,
+	) => Promise<BranchSummaryResult>;
 	buildSessionContext?: (entries: Parameters<typeof codingAgent.buildSessionContext>[0]) => { messages: Context["messages"] };
 	keyHint?: (action: string, fallback: string) => string;
 };
@@ -594,18 +612,14 @@ function resultErrorText(message: SDKMessage): string | undefined {
 	return `Claude Code failed: ${result.subtype ?? "unknown result"}`;
 }
 
-function isolatedStreamFn(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
-	const stream = newAssistantMessageEventStream();
-	void runIsolatedSummary(model, context, options, stream);
-	return stream;
-}
-
-async function runIsolatedSummary(
+// The host's oneshot retry classifies a returned `stopReason: "error"` message
+// exactly like a thrown one, so a transient Claude Code failure still gets its
+// retry: never throw where an error output will do.
+async function isolatedCompleteFn(
 	model: Model<any>,
 	context: Context,
-	options: SimpleStreamOptions | undefined,
-	stream: AssistantMessageEventStream,
-): Promise<void> {
+	options?: SimpleStreamOptions,
+): Promise<AssistantMessage> {
 	let sdkQuery: ReturnType<typeof query> | undefined;
 	let wasAborted = false;
 	const onAbort = () => {
@@ -670,30 +684,23 @@ async function runIsolatedSummary(
 		}
 
 		if (wasAborted) {
-			const output = newAssistantOutput(model, "", "aborted", "Operation aborted");
 			debug("compact summary: aborted");
-			stream.push({ type: "error", reason: "aborted", error: output });
-			stream.end();
-			return;
+			return newAssistantOutput(model, "", "aborted", "Operation aborted");
 		}
 
 		const text = finalText || assistantText;
 		if (errorText || !text.trim()) {
 			const msg = errorText ?? "Claude Code summary returned empty text";
 			debug(`compact summary: error ${msg}`);
-			stream.push({ type: "error", reason: "error", error: newAssistantOutput(model, "", "error", msg) });
-			stream.end();
-			return;
+			return newAssistantOutput(model, "", "error", msg);
 		}
 
 		debug(`compact summary: done textLen=${text.length}`);
-		stream.push({ type: "done", reason: "stop", message: newAssistantOutput(model, text, "stop") });
-		stream.end();
+		return newAssistantOutput(model, text, "stop");
 	} catch (err) {
 		const msg = errorMessage(err);
-		debug("runIsolatedSummary threw; pushing terminal error", err);
-		stream.push({ type: "error", reason: "error", error: newAssistantOutput(model, "", "error", msg) });
-		stream.end();
+		debug("isolatedCompleteFn threw; returning terminal error", err);
+		return newAssistantOutput(model, "", "error", msg);
 	} finally {
 		options?.signal?.removeEventListener("abort", onAbort);
 		try { sdkQuery?.close(); } catch {}
@@ -2583,12 +2590,9 @@ export default function (pi: ExtensionAPI) {
 				event.preparation,
 				ctx.model,
 				undefined,
-				undefined,
 				event.customInstructions,
 				event.signal,
-				undefined,
-				isolatedStreamFn,
-				undefined,
+				{ completeImpl: isolatedCompleteFn },
 			);
 			debug(`session_before_compact: takeover complete summaryLen=${compaction.summary.length}`);
 			return { compaction };
@@ -2616,12 +2620,15 @@ export default function (pi: ExtensionAPI) {
 
 	// Branch summarization — rewind or fork-at-point with "summarize" — is the other
 	// place pi asks the model for a summary, and unlike compaction it runs through
-	// the *agent's* stream function (agent-session passes `streamFn:
-	// this.agent.streamFunction`). On a bridge model that reaches this provider
-	// carrying pi's internal summarization prompt, which no `before_agent_start`
-	// ever recorded, so the prompt-capture resolver has nothing to resolve it to.
-	// Take it over the way compaction is taken over: the summary runs as its own
-	// Claude Code subprocess, never touching the live session or the resolver.
+	// the *agent's* own stream (agent-session hands generateBranchSummary a
+	// `completeImpl` that drains `#sideStreamFn`). On a bridge model that reaches
+	// this provider carrying pi's internal summarization prompt, which no
+	// `before_agent_start` ever recorded, so the prompt-capture resolver has
+	// nothing to resolve it to. Take it over the way compaction is taken over: the
+	// summary runs as its own Claude Code subprocess, never touching the live
+	// session or the resolver. OMP does not re-export `generateBranchSummary`
+	// through its legacy shim, so this only installs on a host that does; there,
+	// the host's own path summarizes through the provider.
 	pi.on("session_before_tree", async (event, ctx) => {
 		if (ctx.model?.baseUrl !== "claude-bridge") return undefined;
 		if (!hostGenerateBranchSummary) {
@@ -2637,7 +2644,7 @@ export default function (pi: ExtensionAPI) {
 				signal: event.signal,
 				customInstructions,
 				replaceInstructions,
-				streamFn: isolatedStreamFn,
+				completeImpl: isolatedCompleteFn,
 			});
 			return branchSummaryOutcome(result);
 		} catch (err) {

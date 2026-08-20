@@ -407,6 +407,28 @@ function readCarriedAttachments(sessionId: string, cwd: string): CarriedAttachme
 
 let sharedSession: SessionState | null = null;
 
+// Which host session owns `sharedSession`.
+//
+// Prompt-capture provenance cannot separate an OMP subagent from its parent:
+// both prompts are recorded exactly, neither embeds the other, so `inherited` is
+// empty and `sharesSubstantialPrefix` undefined on both. The host's own session
+// id can — it is stable across a conversation's turns and distinct per subagent.
+//
+// Claimed by the first non-reentrant query, so start order decides and never
+// completion order: a child dispatched inside its parent's turn can finish
+// first, and letting a completion claim ownership would hand it the session and
+// then drop the parent's own write.
+let sharedOwner: string | undefined;
+
+function foreignBySession(sessionId: string | undefined, isReentrant: boolean): boolean {
+	if (sessionId === undefined) return false;
+	if (sharedOwner !== undefined) return sessionId !== sharedOwner;
+	if (isReentrant) return false;
+	sharedOwner = sessionId;
+	debug(`owner: shared session claimed by host session ${sessionId}`);
+	return false;
+}
+
 // pi /compact, session-tree navigation (rewind / fork-at-point / branch switch)
 // and a mid-session model switch all leave the persisted CC session describing
 // something other than pi's current history — or describing the wrong model.
@@ -1068,7 +1090,15 @@ function syncSharedSession(
 export const __test = {
 	resetSharedSession() {
 		sharedSession = null;
+		sharedOwner = undefined;
 	},
+	setSharedOwner(owner: string | undefined) {
+		sharedOwner = owner;
+	},
+	getSharedOwner() {
+		return sharedOwner;
+	},
+	foreignBySession,
 	setSharedSession(state: SessionState | null) {
 		sharedSession = state;
 	},
@@ -2159,8 +2189,12 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	warnOnRewrittenPromptPassthrough(promptCapture);
 	// A pass-through capture that shares no substantial prefix with anything this
 	// bridge recorded is a different conversation, not a rewrite of this one — see
-	// `sharesSubstantialPrefix` in prompt-capture.ts.
-	const foreignConversation = promptCapture?.sharesSubstantialPrefix === false;
+	// `sharesSubstantialPrefix` in prompt-capture.ts. That covers a side agent but
+	// not a subagent: under OMP a child's prompt is recorded exactly like its
+	// parent's, so no field on either capture separates them. The host session id
+	// does.
+	const foreignConversation = promptCapture?.sharesSubstantialPrefix === false
+		|| foreignBySession((options as { sessionId?: string } | undefined)?.sessionId, isReentrant);
 	const systemPromptAppend = promptCapture
 		? projectPromptCapture(promptCapture, {
 			skillReadTool: mcpTools.some((tool) => tool.name === "read") ? "mcp" : "none",
@@ -2652,6 +2686,9 @@ export default function (pi: ExtensionAPI) {
 		debug(`${event}: clearing session ${sharedSession?.sessionId?.slice(0, 8) ?? "none"}`);
 		sharedSession = null;
 		lastNotifiedRateLimitState.clear();
+		// A new, resumed or forked conversation is a different owner; leaving the old
+		// one behind would make the next turn look foreign to itself.
+		sharedOwner = undefined;
 
 		// Release the pin if this instance owns it, so /reload lets the next
 		// instance pin its own streamSimple instead of inheriting stale state.

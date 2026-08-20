@@ -52,7 +52,12 @@ try {
  * @param {number} opts.defaultTimeout - Default timeout for send/wait operations (default: 30000)
  */
 export function createRpcHarness(opts) {
-	const { name, args = [], env = {}, cwd = DIR, defaultTimeout = 30_000 } = opts;
+	// bin: OMP is not interchangeable with pi for subagent work. Its native agents
+	// go through before_agent_start, so the bridge captures their prompts and the
+	// child actually runs; a dispatcher that rebuilds the child prompt
+	// (pi-subagents) leaves nothing to match and the child dies in prompt-capture
+	// before it ever reaches the provider.
+	const { name, args = [], env = {}, cwd = DIR, defaultTimeout = 30_000, bin = "pi" } = opts;
 
 	const LOGDIR = `${DIR}/.test-output`;
 	mkdirSync(LOGDIR, { recursive: true });
@@ -76,8 +81,9 @@ export function createRpcHarness(opts) {
 		writeFileSync(DEBUG_LOG, "");
 		stopped = false;
 		rpcLog = createWriteStream(RPC_LOG, { flags: "a" });
-		const spawnArgs = ["--no-session", "-ne", "-e", DIR, "--mode", "rpc", ...args];
-		pi = spawn("pi", spawnArgs, {
+		// OMP exits with `unknown flag: -ne`, so the long form is the portable one.
+		const spawnArgs = ["--no-session", "--no-extensions", "-e", DIR, "--mode", "rpc", ...args];
+		pi = spawn(bin, spawnArgs, {
 			cwd,
 			stdio: ["pipe", "pipe", "pipe"],
 			env: { ...process.env, PATH: cleanPath, CLAUDE_BRIDGE_DEBUG: "1", CLAUDE_BRIDGE_DEBUG_PATH: DEBUG_LOG, ...env },

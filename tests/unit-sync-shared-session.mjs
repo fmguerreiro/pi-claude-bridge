@@ -178,4 +178,37 @@ describe("syncSharedSession", () => {
 			rmSync(cwd, { recursive: true, force: true });
 		}
 	});
+
+	// Under OMP a subagent's prompt is recorded exactly like its parent's, so no
+	// field on either capture separates them and prompt provenance cannot classify
+	// the child. The host session id can, and it is claimed at query start rather
+	// than by whoever completes first: a child dispatched inside its parent's turn
+	// can finish before the parent's opening turn does, and letting a completion
+	// claim ownership would hand the session to the child and then refuse the
+	// parent's own write.
+	it("claims conversation ownership for the first non-reentrant query", () => {
+		assert.equal(__test.foreignBySession("session-parent", false), false, "the first top-level query owns the conversation");
+		assert.equal(__test.getSharedOwner(), "session-parent");
+		assert.equal(__test.foreignBySession("session-parent", false), false, "later turns of the same conversation are not foreign");
+		assert.equal(__test.foreignBySession("session-child", false), true, "another host session is a different conversation");
+		assert.equal(__test.foreignBySession("session-child", true), true, "reentrancy does not make a child's session its parent's");
+	});
+
+	// A reentrant query is already isolated by the reentrant flag, so it must not
+	// become the owner just by arriving first — that would make the real
+	// conversation look foreign to itself for the rest of the session.
+	it("does not let a reentrant query claim ownership", () => {
+		assert.equal(__test.foreignBySession("session-child", true), false);
+		assert.equal(__test.getSharedOwner(), undefined, "a nested query must leave ownership unsettled");
+
+		assert.equal(__test.foreignBySession("session-parent", false), false);
+		assert.equal(__test.getSharedOwner(), "session-parent");
+	});
+
+	// Hosts that do not identify their sessions must keep the old behaviour rather
+	// than have every query read as foreign.
+	it("classifies nothing by session when the host supplies no session id", () => {
+		assert.equal(__test.foreignBySession(undefined, false), false);
+		assert.equal(__test.getSharedOwner(), undefined);
+	});
 });

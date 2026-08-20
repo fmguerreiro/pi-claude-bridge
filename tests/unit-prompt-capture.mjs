@@ -76,6 +76,21 @@ describe("PromptCaptures", () => {
 		assert.equal(captures.resolve(wrapped), undefined, "a derived capture is not retained");
 	});
 
+	// The provider reads `sharesSubstantialPrefix === false` to decide a query
+	// belongs to another conversation. An extension-wrapped top-level prompt embeds
+	// a recorded prompt, so `inherited` is non-empty on it exactly as it is on a
+	// subagent's capture — which is why inheritance cannot stand in for that test.
+	// Getting this wrong isolates a real turn from its own session every time.
+	it("does not mark an extension-wrapped prompt as another conversation", () => {
+		const captures = new PromptCaptures();
+		captures.record(PARENT_KEY, capture({ contextFiles: [{ path: "/AGENTS.md", content: "parent rules" }] }));
+
+		const wrapped = captures.resolveOrDerive(`PREFIX FROM ANOTHER EXTENSION\n\n${PARENT_KEY}\n\nSUFFIX`);
+
+		assert.ok(wrapped.inherited.length > 0, "the wrapper embeds a recorded prompt, or this proves nothing");
+		assert.notEqual(wrapped.sharesSubstantialPrefix, false, "a wrapped top-level prompt is the same conversation and must keep its own session");
+	});
+
 	it("revives an exact capture whose lookup key was evicted", () => {
 		const captures = new PromptCaptures(2);
 		captures.record(PARENT_KEY, capture({ contextFiles: [{ path: "/AGENTS.md", content: "parent rules" }] }));

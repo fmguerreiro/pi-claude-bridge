@@ -20,6 +20,7 @@ import { makePromptStream, userMessage, type PromptStream } from "./prompt-strea
 import {
 	claudeCodeSettingSources,
 	claudeCodeSettings,
+	isOmpAgentDir,
 	loadConfig,
 	markStartupNoticeShown,
 	type Config,
@@ -57,27 +58,60 @@ type HostSessionManager = {
 	buildSessionContext?: () => { messages: Context["messages"] };
 	getBranch: () => Parameters<typeof codingAgent.buildSessionContext>[0];
 };
-// The summarization entry points take a *completion* override, not a stream
-// function, and `compact` takes its instructions/signal directly rather than
-// behind a headers argument. The `@earendil-works` package this builds against
-// still declares the older shape, and it is not the package the host runs, so
-// the live shape is declared here instead of inferred from that declaration.
-// tests/unit-pi-streamfn-inventory.mjs audits that older package, not the host.
+// Both hosts export these, with different signatures, and the cast below erases
+// the difference. Passing one host's shape to the other is silent rather than a
+// type error: the wrong slots take the wrong values, the summarization override
+// is dropped, and the host falls back to resolving the bridge model through its
+// own provider — "No API key for provider: claude-bridge" on OMP, "No API
+// provider registered for api: claude-bridge" on Pi. So each shape is declared
+// here and selected by arity, and every call is checked against the declaration
+// for the host it is going to.
+//
+//   Pi:  compact(preparation, model, apiKey, headers, customInstructions,
+//                signal, thinkingLevel, streamFn, env, retry, callbacks)
+//   OMP: compact(preparation, model, apiKey, customInstructions, signal, options)
+//
+// `@earendil-works` declares Pi's shape, so OMP's is written out longhand.
+// tests/unit-pi-streamfn-inventory.mjs audits that package; the live shape of
+// each installed host is pinned by tests/unit-host-compact-shape.mjs.
 type HostCompleteImpl = (model: Model<any>, context: Context, options?: SimpleStreamOptions) => Promise<AssistantMessage>;
+type HostStreamFn = (model: Model<any>, context: Context, options?: SimpleStreamOptions) => AssistantMessageEventStream;
 type HostSummaryOptions = { completeImpl: HostCompleteImpl };
+
+type OmpCompactFn = (
+	preparation: SessionBeforeCompactEvent["preparation"],
+	model: Model<any>,
+	apiKey: undefined,
+	customInstructions?: string,
+	signal?: AbortSignal,
+	options?: HostSummaryOptions,
+) => Promise<CompactionResult>;
+
+type PiCompactFn = (
+	preparation: SessionBeforeCompactEvent["preparation"],
+	model: Model<any>,
+	apiKey: undefined,
+	headers: undefined,
+	customInstructions?: string,
+	signal?: AbortSignal,
+	thinkingLevel?: undefined,
+	streamFn?: HostStreamFn,
+	env?: undefined,
+) => Promise<CompactionResult>;
+
+type OmpBranchSummaryFn = (
+	entries: SessionEntry[],
+	options: Omit<GenerateBranchSummaryOptions, "streamFn"> & HostSummaryOptions,
+) => Promise<BranchSummaryResult>;
+
+type PiBranchSummaryFn = (
+	entries: SessionEntry[],
+	options: Omit<GenerateBranchSummaryOptions, "streamFn"> & { streamFn: HostStreamFn },
+) => Promise<BranchSummaryResult>;
+
 type HostCodingAgent = {
-	compact?: (
-		preparation: SessionBeforeCompactEvent["preparation"],
-		model: Model<any>,
-		apiKey: undefined,
-		customInstructions?: string,
-		signal?: AbortSignal,
-		options?: HostSummaryOptions,
-	) => Promise<CompactionResult>;
-	generateBranchSummary?: (
-		entries: SessionEntry[],
-		options: Omit<GenerateBranchSummaryOptions, "streamFn"> & HostSummaryOptions,
-	) => Promise<BranchSummaryResult>;
+	compact?: OmpCompactFn | PiCompactFn;
+	generateBranchSummary?: OmpBranchSummaryFn | PiBranchSummaryFn;
 	buildSessionContext?: (entries: Parameters<typeof codingAgent.buildSessionContext>[0]) => { messages: Context["messages"] };
 	keyHint?: (action: string, fallback: string) => string;
 };
@@ -85,6 +119,24 @@ type HostCodingAgent = {
 const hostCodingAgent = codingAgent as unknown as HostCodingAgent;
 const hostCompact = hostCodingAgent.compact;
 const hostGenerateBranchSummary = hostCodingAgent.generateBranchSummary;
+
+// Pi's 8th positional parameter is `streamFn`; OMP's whole signature is 6 wide.
+// `>=` so a Pi release that appends a parameter still reads as Pi.
+const PI_STREAM_FN_SLOT = 8;
+
+type HostSummarizationApi = "pi-positional" | "omp-options";
+
+/** `generateBranchSummary` is `(entries, options)` on both hosts, so it cannot be
+ *  probed on its own and follows whatever `compact` reports. The agent-dir
+ *  fallback only matters on a host that exports no `compact` to measure. */
+function detectHostSummarizationApi(compactFn: unknown, agentDir: string): HostSummarizationApi {
+	if (typeof compactFn === "function") {
+		return compactFn.length >= PI_STREAM_FN_SLOT ? "pi-positional" : "omp-options";
+	}
+	return isOmpAgentDir(agentDir) ? "omp-options" : "pi-positional";
+}
+
+const hostSummarizationApi = detectHostSummarizationApi(hostCompact, getAgentDir());
 
 function normalizeSystemPrompt(value: string | readonly string[] | undefined): string | undefined {
 	if (typeof value === "string") return value || undefined;
@@ -707,6 +759,57 @@ async function isolatedCompleteFn(
 	}
 }
 
+// Pi's summarization takes a stream function, so the message isolatedCompleteFn
+// produces is replayed as a single terminal event. A failed summary has to ride
+// the `error` event, not `done`: that is how pi's own summarizer reports failure,
+// and pi's retry classifies it the same way OMP classifies `stopReason: "error"`.
+function isolatedStreamFn(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
+	const stream = newAssistantMessageEventStream();
+	// isolatedCompleteFn returns an error output rather than throwing.
+	void isolatedCompleteFn(model, context, options).then((message) => {
+		if (message.stopReason === "error" || message.stopReason === "aborted") {
+			stream.push({ type: "error", reason: message.stopReason, error: message });
+		} else {
+			// A one-shot summary only ever stops or runs out of room; `pending` and
+			// `toolUse` are unreachable here and the event type excludes the former.
+			const reason = message.stopReason === "length" ? "length" : "stop";
+			stream.push({ type: "done", reason, message });
+		}
+		stream.end();
+	});
+	return stream;
+}
+
+/** Each branch casts to the signature of the host it is calling, so the argument
+ *  list is type-checked per host rather than trusted. */
+function callHostCompact(
+	fn: NonNullable<HostCodingAgent["compact"]>,
+	preparation: SessionBeforeCompactEvent["preparation"],
+	model: Model<any>,
+	customInstructions: string | undefined,
+	signal: AbortSignal | undefined,
+): Promise<CompactionResult> {
+	if (hostSummarizationApi === "pi-positional") {
+		return (fn as PiCompactFn)(
+			preparation, model, undefined, undefined, customInstructions, signal, undefined, isolatedStreamFn, undefined,
+		);
+	}
+	return (fn as OmpCompactFn)(
+		preparation, model, undefined, customInstructions, signal, { completeImpl: isolatedCompleteFn },
+	);
+}
+
+function callHostBranchSummary(
+	fn: NonNullable<HostCodingAgent["generateBranchSummary"]>,
+	entries: SessionEntry[],
+	options: Omit<GenerateBranchSummaryOptions, "streamFn">,
+): Promise<BranchSummaryResult> {
+	if (hostSummarizationApi === "pi-positional") {
+		return (fn as PiBranchSummaryFn)(entries, { ...options, streamFn: isolatedStreamFn });
+	}
+	return (fn as OmpBranchSummaryFn)(entries, { ...options, completeImpl: isolatedCompleteFn });
+}
+
 function reinjectPriorCompactionFileOps(branchEntries: Array<{ type: string; details?: unknown }>, preparation: { fileOps: { read: Set<string>; edited: Set<string> } }): void {
 	const prior = [...branchEntries]
 		.reverse()
@@ -1000,6 +1103,7 @@ export const __test = {
 	branchSummaryOutcome,
 	pinStreamSimple,
 	ACTIVE_STREAM_SIMPLE_KEY,
+	detectHostSummarizationApi,
 };
 
 // --- Provider helpers: tool name mapping ---
@@ -2607,17 +2711,12 @@ export default function (pi: ExtensionAPI) {
 		debug(
 			`session_before_compact: takeover reason=${event.reason} willRetry=${event.willRetry} ` +
 			`isSplitTurn=${event.preparation.isSplitTurn} messages=${event.preparation.messagesToSummarize.length} ` +
-			`turnPrefix=${event.preparation.turnPrefixMessages.length}`,
+			`turnPrefix=${event.preparation.turnPrefixMessages.length} api=${hostSummarizationApi}`,
 		);
 		try {
 			reinjectPriorCompactionFileOps(event.branchEntries, event.preparation);
-			const compaction = await hostCompact(
-				event.preparation,
-				ctx.model,
-				undefined,
-				event.customInstructions,
-				event.signal,
-				{ completeImpl: isolatedCompleteFn },
+			const compaction = await callHostCompact(
+				hostCompact, event.preparation, ctx.model, event.customInstructions, event.signal,
 			);
 			debug(`session_before_compact: takeover complete summaryLen=${compaction.summary.length}`);
 			return { compaction };
@@ -2662,14 +2761,13 @@ export default function (pi: ExtensionAPI) {
 		}
 		const { entriesToSummarize, userWantsSummary, customInstructions, replaceInstructions } = event.preparation;
 		if (!userWantsSummary || entriesToSummarize.length === 0) return undefined;
-		debug(`session_before_tree: takeover entries=${entriesToSummarize.length} target=${event.preparation.targetId.slice(0, 8)}`);
+		debug(`session_before_tree: takeover entries=${entriesToSummarize.length} target=${event.preparation.targetId.slice(0, 8)} api=${hostSummarizationApi}`);
 		try {
-			const result = await hostGenerateBranchSummary(entriesToSummarize, {
+			const result = await callHostBranchSummary(hostGenerateBranchSummary, entriesToSummarize, {
 				model: ctx.model,
 				signal: event.signal,
 				customInstructions,
 				replaceInstructions,
-				completeImpl: isolatedCompleteFn,
 			});
 			return branchSummaryOutcome(result);
 		} catch (err) {

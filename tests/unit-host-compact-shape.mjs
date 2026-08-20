@@ -1,20 +1,25 @@
 #!/usr/bin/env node
 
 /**
- * `HostCodingAgent.compact` / `.generateBranchSummary` in src/index.ts are
- * hand-declared: the `@earendil-works` package this builds against still carries
- * the older shape, so the compiler checks the call against our own declaration
- * rather than against the host that will serve it. Nothing then notices when the
- * host moves — which is how the takeover came to pass an 11-argument positional
- * call to a 6-argument function, dropping the completion override and failing
- * every compaction with "No API key for provider: claude-bridge".
+ * The two summarization takeovers call host functions whose signatures differ
+ * between Pi and OMP, behind a `codingAgent as unknown as HostCodingAgent` cast.
+ * Sending one host the other's shape is silent, not a type error: the wrong slots
+ * take the wrong values, the summarization override is dropped, and the host
+ * falls back to resolving the bridge model through its own provider — which is
+ * how `/compact` came to fail with "No API key for provider: claude-bridge" on
+ * OMP, and later "No API provider registered for api: claude-bridge" on Pi.
  *
- * So this asks the installed host directly: the arity it really exposes, and
- * whether it really routes summarization through `options.completeImpl`. The
- * probe runs under Bun because the host's source imports `.md` prompt files.
+ * The declarations in src/index.ts are hand-written, so the compiler checks each
+ * call against our own description of a host rather than against the host. These
+ * tests close that gap from both ends:
  *
- * Companion to unit-pi-streamfn-inventory.mjs, which audits the `@earendil-works`
- * package. This one audits the host that actually runs.
+ *   1. every installed host really has the arity the dispatcher keys on, and
+ *      really routes summarization through the override the bridge hands it;
+ *   2. `detectHostSummarizationApi` maps each host's real arity to the shape
+ *      written for that host.
+ *
+ * The probe runs under Bun because OMP's source imports `.md` prompt files.
+ * A host that is not installed is skipped, not failed.
  */
 
 import { describe, it } from "node:test";
@@ -23,37 +28,69 @@ import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
+const { __test } = await import("../src/index.js");
+const { detectHostSummarizationApi } = __test;
+
 const probe = join(dirname(fileURLToPath(import.meta.url)), "lib", "probe-host-compact.mjs");
 
 function runProbe() {
 	try {
 		return JSON.parse(execFileSync("bun", [probe], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }));
 	} catch (err) {
-		if (err.code === "ENOENT") return { available: false, reason: "bun not on PATH" };
+		if (err.code === "ENOENT") return null;
 		throw err;
 	}
 }
 
-const host = runProbe();
+/** A function whose only interesting property is its arity, which is what the
+ *  dispatcher reads. */
+const stubWithArity = (n) => new Function(...Array.from({ length: n }, (_, i) => `a${i}`), "");
 
-describe("installed host summarization contract", () => {
-	it("exposes the argument counts src/index.ts is written against", (t) => {
-		if (!host.available) return t.skip(`host not installed (${host.reason ?? host.tried?.join(", ")})`);
-		assert.equal(host.arity.compact, 6, "compact grew or lost parameters; the hand-declared HostCodingAgent signature is stale");
-		assert.equal(host.arity.generateBranchSummary, 2, "generateBranchSummary is no longer (entries, options)");
-	});
+const hosts = runProbe();
 
-	it("routes compaction through options.completeImpl", (t) => {
-		if (!host.available) return t.skip("host not installed");
-		assert.equal(host.compact.ok, true, `compact rejected the call shape: ${host.compact.error}`);
-		assert.ok(host.compact.calls > 0, "the host never called completeImpl, so the takeover is not in effect");
-		assert.ok(host.compact.usedStub, "the summary did not come from completeImpl");
-	});
+// arity => the call shape src/index.ts writes for that host
+const EXPECTED = {
+	omp: { compact: 6, api: "omp-options", dir: "/home/u/.omp/agent" },
+	pi: { compact: 11, api: "pi-positional", dir: "/home/u/.pi/agent" },
+};
 
-	it("routes branch summarization through options.completeImpl", (t) => {
-		if (!host.available) return t.skip("host not installed");
-		assert.equal(host.branchSummary.ok, true, `generateBranchSummary rejected the options: ${host.branchSummary.error}`);
-		assert.ok(host.branchSummary.calls > 0, "the host never called completeImpl");
-		assert.ok(host.branchSummary.usedStub, "the summary did not come from completeImpl");
+for (const [name, expected] of Object.entries(EXPECTED)) {
+	describe(`installed ${name} host summarization contract`, () => {
+		const host = hosts?.[name];
+
+		it("exposes the argument count the dispatcher keys on", (t) => {
+			if (!hosts) return t.skip("bun not on PATH");
+			if (!host.available) return t.skip(`not installed (tried ${host.tried.join(", ")})`);
+			assert.equal(host.arity.compact, expected.compact,
+				`compact changed shape; the hand-declared ${name} signature in src/index.ts is stale`);
+			assert.equal(host.arity.generateBranchSummary, 2,
+				"generateBranchSummary is no longer (entries, options)");
+		});
+
+		it("is dispatched the shape written for it", (t) => {
+			if (!hosts) return t.skip("bun not on PATH");
+			if (!host.available) return t.skip("not installed");
+			assert.equal(
+				detectHostSummarizationApi(stubWithArity(host.arity.compact), expected.dir),
+				expected.api,
+				`a ${host.arity.compact}-argument compact must be dispatched as ${expected.api}`,
+			);
+		});
+
+		it("routes compaction through the override the bridge passes", (t) => {
+			if (!hosts) return t.skip("bun not on PATH");
+			if (!host.available) return t.skip("not installed");
+			assert.equal(host.compact.ok, true, `compact rejected the call: ${host.compact.error}`);
+			assert.ok(host.compact.calls > 0, "the host never called the override, so the takeover is not in effect");
+			assert.ok(host.compact.usedOverride, "the summary did not come from the override");
+		});
+
+		it("routes branch summarization through the override the bridge passes", (t) => {
+			if (!hosts) return t.skip("bun not on PATH");
+			if (!host.available) return t.skip("not installed");
+			assert.equal(host.branchSummary.ok, true, `generateBranchSummary rejected the options: ${host.branchSummary.error}`);
+			assert.ok(host.branchSummary.calls > 0, "the host never called the override");
+			assert.ok(host.branchSummary.usedOverride, "the summary did not come from the override");
+		});
 	});
-});
+}

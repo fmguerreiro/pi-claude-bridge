@@ -382,6 +382,9 @@ interface SessionState {
 	// this — there's no concurrent CC writer during those events, so
 	// in-place rebuild (preserve UUID, deleteSession + createSession) is safe.
 	forceRotate?: boolean;
+	// The owning host session's history epoch when this state was built. REUSE
+	// additionally requires it to still match — see historyEpoch().
+	epoch?: number;
 }
 
 /**
@@ -429,6 +432,60 @@ function foreignBySession(sessionId: string | undefined, isReentrant: boolean): 
 	return false;
 }
 
+// How many times each host session has rewritten its own history (compaction,
+// tree navigation, model switch).
+//
+// Lives in a Symbol.for() global for the same reason ACTIVE_STREAM_SIMPLE_KEY
+// does. The pinned streamSimple funnels every module instance's queries into one
+// closure, so `sharedSession` is only ever mutated by the pinned instance — but
+// `pi.on("session_compact")` fires on the instance owning the *compacting*
+// session, which is a different instance for every subagent and, under OMP, for
+// the top-level session too. markRebuild running there mutated a `sharedSession`
+// that was null, returned at its own guard, and the invalidation was lost with no
+// trace: five consecutive compactions each freed ~200k tokens on pi's side while
+// the resumed CC session kept serving the same 320k prefix (cache_creation stayed
+// at the per-turn delta across all five), so pi's threshold never cleared and its
+// compaction-loop guard eventually paused maintenance.
+//
+// Keyed by host session id, not a single process-wide counter: with every role
+// routed through this provider a subagent compacts constantly, and a global
+// counter would invalidate the parent's session on each one, paying a full
+// rebuild — the expensive half of what this fixes.
+const HISTORY_EPOCHS_KEY = Symbol.for("claude-bridge:historyEpochs");
+
+function historyEpochs(): Map<string, number> {
+	const globals = globalThis as Record<symbol, unknown>;
+	const existing = globals[HISTORY_EPOCHS_KEY] as Map<string, number> | undefined;
+	if (existing) return existing;
+	const created = new Map<string, number>();
+	globals[HISTORY_EPOCHS_KEY] = created;
+	return created;
+}
+
+/** The epoch REUSE must match. */
+function historyEpoch(owner: string | undefined): number {
+	const epochs = historyEpochs();
+	// No owner means the host never supplied a session id, so bumps cannot be
+	// attributed and per-session keying is meaningless. Take the maximum: a
+	// rewrite anywhere still forces the rebuild, which is the safe direction.
+	if (owner === undefined) {
+		let max = 0;
+		for (const value of epochs.values()) if (value > max) max = value;
+		return max;
+	}
+	return epochs.get(owner) ?? 0;
+}
+
+/** Record that `sessionId` rewrote its history. Never dereferences
+ *  `sharedSession`, so it cannot be dropped by firing on the wrong instance. */
+function bumpHistoryEpoch(sessionId: string | undefined, reason: string): void {
+	const epochs = historyEpochs();
+	const key = sessionId ?? "";
+	const next = (epochs.get(key) ?? 0) + 1;
+	epochs.set(key, next);
+	debug(`${reason}: history epoch for ${sessionId ?? "<no session id>"} → ${next}`);
+}
+
 // pi /compact, session-tree navigation (rewind / fork-at-point / branch switch)
 // and a mid-session model switch all leave the persisted CC session describing
 // something other than pi's current history — or describing the wrong model.
@@ -441,6 +498,10 @@ function foreignBySession(sessionId: string | undefined, isReentrant: boolean): 
 // Module-level rather than closed over `activate`: the turn-assembly path
 // invalidates from outside the extension handlers too, and sharedSession is
 // single-writer, so every invalidation goes through here.
+//
+// Only reaches the pinned instance's state, so an extension handler on any other
+// instance silently no-ops here. Callers that can fire on a non-pinned instance
+// must also bump the history epoch, which is global — see historyEpochs().
 function markRebuild(reason: string): void {
 	if (!sharedSession) return;
 	debug(`${reason}: marking needsRebuild on session ${sharedSession.sessionId.slice(0, 8)}`);
@@ -982,7 +1043,16 @@ function syncSharedSession(
 	// pi-side history rewrites such as /compact and session_tree: without it,
 	// missed = [].slice(cursor) can falsely hit REUSE and resume an unrelated
 	// longer CC session. See issue #25.
-	if (sharedSession && !sharedSession.needsRebuild && priorMessages.length >= sharedSession.cursor) {
+	//
+	// The epoch check is the same invariant made independent of this state object.
+	// needsRebuild and cursor both live on `sharedSession`, so an invalidation that
+	// lands on the wrong module instance loses the flag *and* leaves a cursor the
+	// compacted history is no longer measured against — both guards then pass at
+	// once and a rewritten conversation is resumed unchanged.
+	const currentEpoch = historyEpoch(sharedOwner);
+	if (sharedSession && sharedSession.epoch !== undefined && sharedSession.epoch !== currentEpoch) {
+		debug(`Case 3 refused: history epoch moved ${sharedSession.epoch}→${currentEpoch} on session ${sharedSession.sessionId.slice(0, 8)}, forcing rebuild`);
+	} else if (sharedSession && !sharedSession.needsRebuild && priorMessages.length >= sharedSession.cursor) {
 		const missed = priorMessages.slice(sharedSession.cursor);
 		const trailingAssistantOnly =
 			missed.length === 1 && (missed[0] as { role?: string }).role === "assistant";
@@ -1016,9 +1086,10 @@ function syncSharedSession(
 	//     current, compressed history, and repairToolPairing inside
 	//     convertAndImportMessages stubs any tool_use the pruning orphaned.
 	//
-	// Only reachable when needsRebuild is false — user-facing history rewrites
-	// (/compact, session_tree, /new, fork) always set needsRebuild or clear
-	// sharedSession before the next syncSharedSession call.
+	// Reached with needsRebuild false whenever the invalidation was lost: the flag
+	// lives on `sharedSession`, so a handler firing on a non-pinned module instance
+	// never set it. The epoch check above catches that for the owning session; this
+	// branch still covers a cursor left stale by anything else.
 	if (sharedSession && !sharedSession.needsRebuild && priorMessages.length < sharedSession.cursor) {
 		if (options?.reentrant) {
 			debug(`Case 1 synthetic: clean start for shorter context, preserving shared session ${sharedSession.sessionId.slice(0, 8)}, cursor=${sharedSession.cursor}`);
@@ -1072,7 +1143,9 @@ function syncSharedSession(
 	// records, not messages: `messages` filters out the attachment records that
 	// carrying an `@file` expansion across a rebuild writes into the same file.
 	verifyWrittenSession(session.jsonlPath, session.sessionId, session.records.length, cwd);
-	sharedSession = { sessionId: session.sessionId, cursor: priorMessages.length, cwd };
+	// currentEpoch, not a fresh read: any bump that lands while this rebuild runs
+	// must still invalidate it, and re-reading here would swallow that.
+	sharedSession = { sessionId: session.sessionId, cursor: priorMessages.length, cwd, epoch: currentEpoch };
 	if (previousSessionId === undefined) {
 		debug(`Case 2: first turn with ${priorMessages.length} prior messages → session ${session.sessionId.slice(0, 8)}, ${session.records.length} records`);
 	} else if (preserveId) {
@@ -1091,6 +1164,11 @@ export const __test = {
 	resetSharedSession() {
 		sharedSession = null;
 		sharedOwner = undefined;
+		historyEpochs().clear();
+	},
+	bumpHistoryEpoch,
+	historyEpoch() {
+		return historyEpoch(sharedOwner);
 	},
 	setSharedOwner(owner: string | undefined) {
 		sharedOwner = owner;
@@ -2413,6 +2491,12 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			debug(`provider: query error, model=${cliModel}, aborted=${Boolean(options?.signal?.aborted)}, error=`, error);
 			if ((wasAborted || options?.signal?.aborted) && sharedSession) {
 				sharedSession = { ...sharedSession, needsRebuild: true, forceRotate: true };
+			} else if (syncResult.preserveSharedSession) {
+				// Same guard the success path uses: this query never owned
+				// `sharedSession`, so a subagent or side-agent failing must not
+				// discard the parent's. Dropping it here also silently disarmed
+				// markRebuild, which returns at its own null check.
+				debug("provider: query error on a non-owning query, shared session left intact");
 			} else {
 				sharedSession = null;
 			}
@@ -2768,16 +2852,25 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 
-	// Invalidation events (markRebuild is module-level, next to sharedSession).
-	pi.on("session_compact", (event) => markRebuild(`session_compact:${event.reason}:willRetry=${event.willRetry}`));
-	pi.on("session_tree", () => markRebuild("session_tree"));
+	// Invalidation events.
+	//
+	// Both halves are needed. markRebuild only reaches this instance's
+	// `sharedSession`, which is the right target when this instance is the pinned
+	// one and a silent no-op otherwise; the epoch bump is global and keyed by the
+	// session that actually rewrote its history, so it survives either way.
+	const invalidate = (ctx: { sessionManager: { getSessionId(): string } }, reason: string) => {
+		bumpHistoryEpoch(ctx.sessionManager.getSessionId(), reason);
+		markRebuild(reason);
+	};
+	pi.on("session_compact", (event, ctx) => invalidate(ctx, `session_compact:${event.reason}:willRetry=${event.willRetry}`));
+	pi.on("session_tree", (_event, ctx) => invalidate(ctx, "session_tree"));
 	// Without this, the next turn after /model takes the REUSE path and resumes a
 	// Claude session created for the previous model: CC serves it on that model's
 	// effective context window, so a conversation well inside the new model's
 	// window fails with "Prompt is too long" (issue #42). pi's own history is
 	// untouched — only the persisted CC session is rebuilt, for the model that
 	// will actually serve the turn.
-	pi.on("model_select", (event) => markRebuild(`model_select:${event.previousModel?.id ?? "?"}->${event.model?.id ?? "?"}`));
+	pi.on("model_select", (event, ctx) => invalidate(ctx, `model_select:${event.previousModel?.id ?? "?"}->${event.model?.id ?? "?"}`));
 
 	// Branch summarization — rewind or fork-at-point with "summarize" — is the other
 	// place pi asks the model for a summary, and unlike compaction it runs through

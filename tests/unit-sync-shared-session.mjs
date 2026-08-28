@@ -211,4 +211,72 @@ describe("syncSharedSession", () => {
 		assert.equal(__test.foreignBySession(undefined, false), false);
 		assert.equal(__test.getSharedOwner(), undefined);
 	});
+
+	// The compaction-loop bug. `needsRebuild` and `cursor` both live on
+	// `sharedSession`, which only the pinned module instance holds, so a
+	// `session_compact` handler firing on any other instance set neither:
+	// markRebuild returned at its own null check and the cursor kept whatever a
+	// short-context query last wrote. Both REUSE guards then passed on a
+	// conversation pi had just rewritten, and the CC session was resumed
+	// unchanged — observed as five consecutive compactions with no cache break,
+	// each freeing ~200k tokens on pi's side and none on the wire, until pi's own
+	// compaction-loop guard paused maintenance.
+	it("refuses to reuse a session whose history epoch moved", () => {
+		const cwd = mkdtempSync(join(tmpdir(), "sync-shared-session-"));
+		const sessionId = randomUUID();
+		try {
+			const priors = [
+				{ role: "user", content: "Resume prior conversation.", timestamp: Date.now() },
+				{ role: "assistant", content: [{ type: "text", text: "Resuming." }], timestamp: Date.now() },
+			];
+			const seeded = createSession({ sessionId, projectPath: cwd });
+			seeded.importMessages(priors.map(({ role, content }) => ({ role, content })));
+			seeded.save();
+
+			__test.setSharedOwner("host-parent");
+			// Exactly the state the bug leaves behind: no needsRebuild, and a cursor
+			// the compacted history is long enough to satisfy.
+			__test.setSharedSession({ sessionId, cursor: priors.length, cwd, epoch: 0 });
+			__test.bumpHistoryEpoch("host-parent", "session_compact:threshold");
+
+			const result = __test.syncSharedSession(
+				[...priors, { role: "user", content: "Keep going.", timestamp: Date.now() }],
+				cwd,
+			);
+
+			assert.equal(result.sessionId, sessionId, "the rebuild preserves the session id");
+			assert.equal(
+				__test.getSharedSession().epoch,
+				1,
+				"a compaction the pinned instance never saw must still force the rebuild — reuse here resumes the pre-compaction prefix and the freed context never reaches Claude",
+			);
+		} finally {
+			deleteSession(sessionId, cwd);
+			rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	// Every role in a typical config routes through this provider, so subagents
+	// compact constantly. Keying the epoch per host session is what stops each of
+	// those from invalidating the parent and charging it a full rebuild.
+	it("ignores a history epoch bumped by another session", () => {
+		const cwd = mkdtempSync(join(tmpdir(), "sync-shared-session-"));
+		try {
+			const priors = [
+				{ role: "user", content: "Parent turn.", timestamp: Date.now() },
+				{ role: "assistant", content: [{ type: "text", text: "Done." }], timestamp: Date.now() },
+			];
+			const mainSession = { sessionId: randomUUID(), cursor: priors.length, cwd, epoch: 0 };
+			__test.setSharedOwner("host-parent");
+			__test.setSharedSession(mainSession);
+			__test.bumpHistoryEpoch("host-subagent", "session_compact:threshold");
+
+			const result = __test.syncSharedSession(priors, cwd);
+
+			assert.equal(result.sessionId, mainSession.sessionId, "a subagent's compaction must not cost the parent a rebuild");
+			assert.deepEqual(__test.getSharedSession(), mainSession);
+		} finally {
+			rmSync(cwd, { recursive: true, force: true });
+		}
+	});
 });

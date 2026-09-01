@@ -882,6 +882,53 @@ function callHostCompact(
 	);
 }
 
+// `snapcompact` and `shake` summarize locally, so there is no provider request to
+// keep off the live stream, and OMP drops its own local path once a hook returns a
+// compaction — taking over would replace the cheaper archive. Only `snapcompact`
+// was observed reaching us. Pi reports no strategy, and unknowns are still taken
+// over: a stranded hang (issue #18) costs more than a re-billed summary.
+const LOCAL_ONLY_COMPACTION_STRATEGIES: Record<string, true> = {
+	snapcompact: true,
+	shake: true,
+	off: true,
+};
+
+function localOnlyCompactionStrategy(preparation: SessionBeforeCompactEvent["preparation"]): string | undefined {
+	const { strategy } = preparation.settings as { strategy?: unknown };
+	if (typeof strategy !== "string") return undefined;
+	return LOCAL_ONLY_COMPACTION_STRATEGIES[strategy] ? strategy : undefined;
+}
+
+// OMP kills an extension handler at 30s, telling the extension neither the
+// deadline nor aborting its work, so an overrun is discarded while its Claude
+// Code subprocess bills on. The `extensionHandlers.toolCallTimeoutMs` setting
+// does not widen this; it only covers `tool_call`.
+const COMPACT_TAKEOVER_BUDGET_MS = 25_000;
+
+/** Abort the summary before OMP's handler cap, so an overrun cannot outlive it. */
+async function withCompactTakeoverDeadline<T>(
+	hostSignal: AbortSignal | undefined,
+	run: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+	const deadline = new AbortController();
+	const signal = hostSignal ? AbortSignal.any([hostSignal, deadline.signal]) : deadline.signal;
+	let timer: NodeJS.Timeout | undefined;
+	const expiry = new Promise<never>((_resolve, reject) => {
+		timer = setTimeout(() => {
+			deadline.abort();
+			reject(new Error(`summary exceeded the ${COMPACT_TAKEOVER_BUDGET_MS}ms extension-handler budget`));
+		}, COMPACT_TAKEOVER_BUDGET_MS);
+		// A pending timer must not be the reason the host refuses to exit.
+		timer.unref?.();
+	});
+	try {
+		// Both arms get a handler here, so the loser rejecting later is not unhandled.
+		return await Promise.race([run(signal), expiry]);
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
 function callHostBranchSummary(
 	fn: NonNullable<HostCodingAgent["generateBranchSummary"]>,
 	entries: SessionEntry[],
@@ -1212,6 +1259,9 @@ export const __test = {
 	pinStreamSimple,
 	ACTIVE_STREAM_SIMPLE_KEY,
 	detectHostSummarizationApi,
+	localOnlyCompactionStrategy,
+	withCompactTakeoverDeadline,
+	COMPACT_TAKEOVER_BUDGET_MS,
 };
 
 // --- Provider helpers: tool name mapping ---
@@ -2829,15 +2879,22 @@ export default function (pi: ExtensionAPI) {
 			debug("session_before_compact: host does not export compaction takeover API");
 			return undefined;
 		}
-		debug(
-			`session_before_compact: takeover reason=${event.reason} willRetry=${event.willRetry} ` +
-			`isSplitTurn=${event.preparation.isSplitTurn} messages=${event.preparation.messagesToSummarize.length} ` +
-			`turnPrefix=${event.preparation.turnPrefixMessages.length} api=${hostSummarizationApi}`,
-		);
 		try {
+			// The host reuses this same preparation for its own local strategy, and
+			// its file-op extraction skips a compaction entry this bridge authored.
 			reinjectPriorCompactionFileOps(event.branchEntries, event.preparation);
-			const compaction = await callHostCompact(
-				hostCompact, event.preparation, ctx.model, event.customInstructions, event.signal,
+			const localStrategy = localOnlyCompactionStrategy(event.preparation);
+			if (localStrategy) {
+				debug(`session_before_compact: declining takeover; host strategy '${localStrategy}' summarizes locally`);
+				return undefined;
+			}
+			debug(
+				`session_before_compact: takeover reason=${event.reason} willRetry=${event.willRetry} ` +
+				`isSplitTurn=${event.preparation.isSplitTurn} messages=${event.preparation.messagesToSummarize.length} ` +
+				`turnPrefix=${event.preparation.turnPrefixMessages.length} api=${hostSummarizationApi}`,
+			);
+			const compaction = await withCompactTakeoverDeadline(event.signal, (signal) =>
+				callHostCompact(hostCompact, event.preparation, ctx.model, event.customInstructions, signal),
 			);
 			debug(`session_before_compact: takeover complete summaryLen=${compaction.summary.length}`);
 			return { compaction };

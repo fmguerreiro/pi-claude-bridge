@@ -462,28 +462,73 @@ function historyEpochs(): Map<string, number> {
 	return created;
 }
 
+// Where a bump with no session id lands. Unattributable, so every reader adds it.
+const UNATTRIBUTED_EPOCH_KEY = "";
+
 /** The epoch REUSE must match. */
 function historyEpoch(owner: string | undefined): number {
 	const epochs = historyEpochs();
+	// Summed, not maxed: a max lets one channel's movement be invisible whenever
+	// the other is already ahead.
+	const unattributed = epochs.get(UNATTRIBUTED_EPOCH_KEY) ?? 0;
 	// No owner means the host never supplied a session id, so bumps cannot be
 	// attributed and per-session keying is meaningless. Take the maximum: a
 	// rewrite anywhere still forces the rebuild, which is the safe direction.
 	if (owner === undefined) {
 		let max = 0;
-		for (const value of epochs.values()) if (value > max) max = value;
-		return max;
+		for (const [key, value] of epochs) {
+			if (key !== UNATTRIBUTED_EPOCH_KEY && value > max) max = value;
+		}
+		return max + unattributed;
 	}
-	return epochs.get(owner) ?? 0;
+	return (epochs.get(owner) ?? 0) + unattributed;
 }
 
 /** Record that `sessionId` rewrote its history. Never dereferences
  *  `sharedSession`, so it cannot be dropped by firing on the wrong instance. */
 function bumpHistoryEpoch(sessionId: string | undefined, reason: string): void {
 	const epochs = historyEpochs();
-	const key = sessionId ?? "";
+	const key = sessionId ?? UNATTRIBUTED_EPOCH_KEY;
 	const next = (epochs.get(key) ?? 0) + 1;
 	epochs.set(key, next);
 	debug(`${reason}: history epoch for ${sessionId ?? "<no session id>"} → ${next}`);
+}
+
+// Host sessions with a Claude Code query in flight. While an id is in here, no
+// history rewrite for it can reach the wire: one `query()` serves the whole turn
+// and the tool-result branch of streamClaudeAgentSdk never re-syncs the session.
+//
+// Symbol.for() for the same reason HISTORY_EPOCHS_KEY is: queries register on
+// the pinned instance, extension handlers fire on the compacting session's.
+//
+// A count, not a set — a retried or nested query can hold the same id, and a set
+// would let the first to settle report the turn as over.
+const LIVE_QUERY_SESSIONS_KEY = Symbol.for("claude-bridge:liveQuerySessions");
+
+function liveQuerySessions(): Map<string, number> {
+	const globals = globalThis as Record<symbol, unknown>;
+	const existing = globals[LIVE_QUERY_SESSIONS_KEY] as Map<string, number> | undefined;
+	if (existing) return existing;
+	const created = new Map<string, number>();
+	globals[LIVE_QUERY_SESSIONS_KEY] = created;
+	return created;
+}
+
+function markQueryLive(sessionId: string): void {
+	const live = liveQuerySessions();
+	live.set(sessionId, (live.get(sessionId) ?? 0) + 1);
+}
+
+function markQuerySettled(sessionId: string): void {
+	const live = liveQuerySessions();
+	const next = (live.get(sessionId) ?? 0) - 1;
+	if (next > 0) live.set(sessionId, next);
+	else live.delete(sessionId);
+}
+
+function queryIsLive(sessionId: string | undefined): boolean {
+	if (sessionId === undefined) return false;
+	return (liveQuerySessions().get(sessionId) ?? 0) > 0;
 }
 
 // pi /compact, session-tree navigation (rewind / fork-at-point / branch switch)
@@ -1212,7 +1257,11 @@ export const __test = {
 		sharedSession = null;
 		sharedOwner = undefined;
 		historyEpochs().clear();
+		liveQuerySessions().clear();
 	},
+	markQueryLive,
+	markQuerySettled,
+	queryIsLive,
 	bumpHistoryEpoch,
 	historyEpoch() {
 		return historyEpoch(sharedOwner);
@@ -2321,8 +2370,9 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// not a subagent: under OMP a child's prompt is recorded exactly like its
 	// parent's, so no field on either capture separates them. The host session id
 	// does.
+	const hostSessionId = (options as { sessionId?: string } | undefined)?.sessionId;
 	const foreignConversation = promptCapture?.sharesSubstantialPrefix === false
-		|| foreignBySession((options as { sessionId?: string } | undefined)?.sessionId, isReentrant);
+		|| foreignBySession(hostSessionId, isReentrant);
 	const systemPromptAppend = promptCapture
 		? projectPromptCapture(promptCapture, {
 			skillReadTool: mcpTools.some((tool) => tool.name === "read") ? "mcp" : "none",
@@ -2471,6 +2521,14 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	};
 	startAttempt();
 	activeQueryContexts.add(queryCtx);
+	// Cleared exactly once, by whichever settlement path below runs first.
+	let liveQuerySession: string | undefined = hostSessionId;
+	if (liveQuerySession !== undefined) markQueryLive(liveQuerySession);
+	const settleLiveQuery = () => {
+		if (liveQuerySession === undefined) return;
+		markQuerySettled(liveQuerySession);
+		liveQuerySession = undefined;
+	};
 
 	// 4. Capture context for abort handling
 	const abortCtx = queryCtx;
@@ -2497,6 +2555,9 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		customToolNameToPi, model, () => wasAborted, queryCtx, mcpTools,
 	)
 		.then(async ({ capturedSessionId }) => {
+			// Before the stream closes: the host's post-turn compaction check fires
+			// on that, and it must not be declined.
+			settleLiveQuery();
 			debug(`provider: consumeQuery completed, stopReason=${queryCtx.turnOutput?.stopReason}, error=${queryCtx.turnOutput?.errorMessage}, aborted=${wasAborted}`);
 
 			// --- Abort detection in normal completion path ---
@@ -2538,6 +2599,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			finalizeCurrentStream(queryCtx, queryCtx.turnOutput?.stopReason);
 		})
 		.catch((error) => {
+			settleLiveQuery();
 			debug(`provider: query error, model=${cliModel}, aborted=${Boolean(options?.signal?.aborted)}, error=`, error);
 			if ((wasAborted || options?.signal?.aborted) && sharedSession) {
 				sharedSession = { ...sharedSession, needsRebuild: true, forceRotate: true };
@@ -2569,6 +2631,8 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			queryCtx.currentPiStream = null;
 		})
 		.finally(() => {
+			// Backstop: .then and .catch each clear it first, and it is idempotent.
+			settleLiveQuery();
 			if (options?.signal) options.signal.removeEventListener("abort", onAbort);
 			// Settle any ack still parked in the generator — the CLI is gone, so
 			// nothing will resume it. Clear the handle only if a later query
@@ -2824,6 +2888,12 @@ export default function (pi: ExtensionAPI) {
 		// one behind would make the next turn look foreign to itself.
 		sharedOwner = undefined;
 
+		// /reload re-evaluates this module in place, abandoning the closure that
+		// would have decremented the count. A stranded entry cancels that session's
+		// compaction forever, so clear all of them — over-clearing costs one
+		// undeclined mid-turn compaction, the same trade as the pin released below.
+		liveQuerySessions().clear();
+
 		// Release the pin if this instance owns it, so /reload lets the next
 		// instance pin its own streamSimple instead of inheriting stale state.
 		const g = globalThis as Record<symbol, unknown>;
@@ -2875,6 +2945,19 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_before_compact", async (event, ctx) => {
 		if (ctx.model?.baseUrl !== "claude-bridge") return undefined;
+		// A rewrite made mid-turn cannot reach the wire (see LIVE_QUERY_SESSIONS_KEY),
+		// and the host cannot tell: it floors the trigger at max(billed, stored), so
+		// billed keeps reporting the uncompacted prefix and it recompacts at every
+		// tool boundary until its loop guard pauses maintenance for good. Cancelling
+		// forfeits nothing — the pre-prompt compaction runs with no query live.
+		const compactingSessionId = ctx.sessionManager.getSessionId();
+		if (queryIsLive(compactingSessionId)) {
+			debug(`session_before_compact: cancelling for ${compactingSessionId}; a live Claude Code query owns this conversation until the turn ends`);
+			return { cancel: true };
+		}
+		// The id agreement is the load-bearing assumption; a registry that never
+		// matches would leave this guard silently inert.
+		debug(`session_before_compact: proceeding for ${compactingSessionId}; no live query (registry holds ${[...liveQuerySessions().keys()].join(",") || "nothing"})`);
 		if (!hostCompact) {
 			debug("session_before_compact: host does not export compaction takeover API");
 			return undefined;

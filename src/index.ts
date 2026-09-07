@@ -269,6 +269,16 @@ function diagDump(label: string, data: Record<string, unknown>) {
 	debug(`DIAG: ${label} (see ${DIAG_LOG_PATH})`);
 }
 
+// Session-lifecycle verdicts, recorded whether or not CLAUDE_BRIDGE_DEBUG is on.
+// Every wrong diagnosis of the compaction loop cost a day because these two
+// decisions - whether a compaction was declined, and whether the next query
+// reused the resumed session or rebuilt it - left no trace on a normal run.
+// One line per query and per compaction attempt.
+function verdict(label: string, data: Record<string, unknown>) {
+	const entry = { ts: new Date().toISOString(), moduleInstanceId, label, ...data };
+	appendFileSync(DIAG_LOG_PATH, JSON.stringify(entry) + "\n");
+}
+
 // --- Constants ---
 
 // Global pin for the provider's streamSimple, shared across module evaluations.
@@ -1112,7 +1122,7 @@ function syncSharedSession(
 	if (options?.foreignConversation) {
 		if (priorMessages.length === 0) {
 			debug("Case foreign: clean start, no priors, shared session left untouched");
-			debug("syncResult: path=foreign-clean-start preserve-shared");
+			verdict("sync", { detail: "syncResult: path=foreign-clean-start preserve-shared" });
 			return { sessionId: null, preserveSharedSession: true };
 		}
 		const session = createSession({
@@ -1124,7 +1134,7 @@ function syncSharedSession(
 		session.save();
 		verifyWrittenSession(session.jsonlPath, session.sessionId, session.records.length, cwd);
 		debug(`Case foreign: imported ${priorMessages.length} priors into fresh session ${session.sessionId.slice(0, 8)}, shared session untouched`);
-		debug(`syncResult: path=foreign-import sessionId=${session.sessionId} preserve-shared`);
+		verdict("sync", { detail: `syncResult: path=foreign-import sessionId=${session.sessionId} preserve-shared` });
 		return { sessionId: session.sessionId, preserveSharedSession: true };
 	}
 
@@ -1153,7 +1163,7 @@ function syncSharedSession(
 				sharedSession = { ...sharedSession, cursor: priorMessages.length, cwd };
 			}
 			debug(`Case 3: ${trailingAssistantOnly ? "advanced cursor past trailing assistant, " : ""}resuming session ${sharedSession.sessionId.slice(0, 8)}, cursor=${sharedSession.cursor}`);
-			debug(`syncResult: path=reuse sessionId=${sharedSession.sessionId} cursor=${sharedSession.cursor}`);
+			verdict("sync", { detail: `syncResult: path=reuse sessionId=${sharedSession.sessionId} cursor=${sharedSession.cursor}` });
 			return { sessionId: sharedSession.sessionId };
 		}
 	}
@@ -1185,7 +1195,7 @@ function syncSharedSession(
 	if (sharedSession && !sharedSession.needsRebuild && priorMessages.length < sharedSession.cursor) {
 		if (options?.reentrant) {
 			debug(`Case 1 synthetic: clean start for shorter context, preserving shared session ${sharedSession.sessionId.slice(0, 8)}, cursor=${sharedSession.cursor}`);
-			debug(`syncResult: path=clean-start preserve-shared sessionId=${sharedSession.sessionId} cursor=${sharedSession.cursor}`);
+			verdict("sync", { detail: `syncResult: path=clean-start preserve-shared sessionId=${sharedSession.sessionId} cursor=${sharedSession.cursor}` });
 			return { sessionId: null, preserveSharedSession: true };
 		}
 		debug(`Case 3→4: Pi history compressed ${sharedSession.cursor}→${priorMessages.length} msgs on a top-level turn, forcing rebuild`);
@@ -1208,7 +1218,7 @@ function syncSharedSession(
 			);
 		}
 		debug(`Case 1: clean start, ${messages.length} total messages`);
-		debug(`syncResult: path=clean-start`);
+		verdict("sync", { detail: `syncResult: path=clean-start` });
 		return { sessionId: null };
 	}
 	const previousSessionId = sharedSession?.sessionId;
@@ -1247,7 +1257,7 @@ function syncSharedSession(
 		debug(`Case 4 post-abort: ${priorMessages.length} total → new session ${session.sessionId.slice(0, 8)} (was ${previousSessionId.slice(0, 8)}, rotated to avoid race with orphan writer), ${session.records.length} records`);
 	}
 	debugSessionPaths(`${session.sessionId.slice(0, 8)}`, cwd, session.jsonlPath);
-	debug(`syncResult: path=rebuild sessionId=${session.sessionId} priors=${priorMessages.length} ${previousSessionId === undefined ? "first" : preserveId ? "preserved" : "rotated-post-abort"}`);
+	verdict("sync", { detail: `syncResult: path=rebuild sessionId=${session.sessionId} priors=${priorMessages.length} ${previousSessionId === undefined ? "first" : preserveId ? "preserved" : "rotated-post-abort"}` });
 	return { sessionId: session.sessionId };
 }
 
@@ -2952,11 +2962,18 @@ export default function (pi: ExtensionAPI) {
 		// forfeits nothing — the pre-prompt compaction runs with no query live.
 		const compactingSessionId = ctx.sessionManager.getSessionId();
 		if (queryIsLive(compactingSessionId)) {
+			verdict("compact_declined", { sessionId: compactingSessionId, reason: event.reason, phase: (event as { phase?: string }).phase ?? null });
 			debug(`session_before_compact: cancelling for ${compactingSessionId}; a live Claude Code query owns this conversation until the turn ends`);
 			return { cancel: true };
 		}
 		// The id agreement is the load-bearing assumption; a registry that never
 		// matches would leave this guard silently inert.
+		verdict("compact_allowed", {
+			sessionId: compactingSessionId,
+			reason: event.reason,
+			phase: (event as { phase?: string }).phase ?? null,
+			registry: [...liveQuerySessions().keys()],
+		});
 		debug(`session_before_compact: proceeding for ${compactingSessionId}; no live query (registry holds ${[...liveQuerySessions().keys()].join(",") || "nothing"})`);
 		if (!hostCompact) {
 			debug("session_before_compact: host does not export compaction takeover API");

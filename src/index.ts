@@ -277,6 +277,7 @@ function diagDump(label: string, data: Record<string, unknown>) {
 function verdict(label: string, data: Record<string, unknown>) {
 	const entry = { ts: new Date().toISOString(), moduleInstanceId, label, ...data };
 	appendFileSync(DIAG_LOG_PATH, JSON.stringify(entry) + "\n");
+	debug(`${label}: ${JSON.stringify(data)}`);
 }
 
 // --- Constants ---

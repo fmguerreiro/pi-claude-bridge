@@ -191,9 +191,12 @@ const RECORD_STREAM_PATH = process.env.CLAUDE_BRIDGE_RECORD_STREAM;
 //   out of a pi session, which serves its own tools.
 // - DISABLE_AUTO_COMPACT=1: pi owns compaction; CC compacting its own copy would
 //   diverge from pi's history, which is the source of truth for every rebuild.
+// - ENABLE_TOOL_SEARCH=false: a stale `tool_search_tool_regex` block in resumed
+//   history 400s the next turn once the deferred-tool pool changes.
 const CC_CHILD_ENV = {
 	ENABLE_CLAUDEAI_MCP_SERVERS: "0",
 	DISABLE_AUTO_COMPACT: "1",
+	ENABLE_TOOL_SEARCH: "false",
 } as const;
 
 // Pi owns context files on the provider path, so Claude Code must not load its

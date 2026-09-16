@@ -285,6 +285,13 @@ function verdict(label: string, data: Record<string, unknown>) {
 	debug(typeof data.detail === "string" ? data.detail : `${label}: ${JSON.stringify(data)}`);
 }
 
+// `ompSessionId` is a separate field rather than more text in `detail`, so the
+// integration tests that parse `syncResult: path=<x> sessionId=<uuid>` off the
+// debug log keep matching.
+function syncVerdict(ompSessionId: string | undefined, detail: string) {
+	verdict("sync", { ompSessionId: ompSessionId ?? null, detail });
+}
+
 // --- Constants ---
 
 // Global pin for the provider's streamSimple, shared across module evaluations.
@@ -1111,8 +1118,14 @@ function syncSharedSession(
 	// settled, with isReentrant false, so it would otherwise fall through to the
 	// REBUILD path below and steal the main conversation's `sharedSession`. See the
 	// early branch immediately below.
-	options?: { reentrant?: boolean; foreignConversation?: boolean },
+	//
+	// hostSessionId: the OMP session this call belongs to. Recorded on every sync
+	// verdict so a compaction in the host's log can be matched to the wire
+	// decision that followed it — the diag log otherwise carries only Claude
+	// Code's own session UUIDs, which nothing maps back to an OMP session.
+	options?: { reentrant?: boolean; foreignConversation?: boolean; hostSessionId?: string },
 ): SyncResult {
+	const hostSessionId = options?.hostSessionId ?? sharedOwner;
 	const priorMessages = messages.slice(0, turnStart(messages)); // everything before the current user turn
 
 	// FOREIGN CONVERSATION path
@@ -1128,7 +1141,7 @@ function syncSharedSession(
 	if (options?.foreignConversation) {
 		if (priorMessages.length === 0) {
 			debug("Case foreign: clean start, no priors, shared session left untouched");
-			verdict("sync", { detail: "syncResult: path=foreign-clean-start preserve-shared" });
+			syncVerdict(hostSessionId, "syncResult: path=foreign-clean-start preserve-shared");
 			return { sessionId: null, preserveSharedSession: true };
 		}
 		const session = createSession({
@@ -1140,7 +1153,7 @@ function syncSharedSession(
 		session.save();
 		verifyWrittenSession(session.jsonlPath, session.sessionId, session.records.length, cwd);
 		debug(`Case foreign: imported ${priorMessages.length} priors into fresh session ${session.sessionId.slice(0, 8)}, shared session untouched`);
-		verdict("sync", { detail: `syncResult: path=foreign-import sessionId=${session.sessionId} preserve-shared` });
+		syncVerdict(hostSessionId, `syncResult: path=foreign-import sessionId=${session.sessionId} preserve-shared`);
 		return { sessionId: session.sessionId, preserveSharedSession: true };
 	}
 
@@ -1169,7 +1182,7 @@ function syncSharedSession(
 				sharedSession = { ...sharedSession, cursor: priorMessages.length, cwd };
 			}
 			debug(`Case 3: ${trailingAssistantOnly ? "advanced cursor past trailing assistant, " : ""}resuming session ${sharedSession.sessionId.slice(0, 8)}, cursor=${sharedSession.cursor}`);
-			verdict("sync", { detail: `syncResult: path=reuse sessionId=${sharedSession.sessionId} cursor=${sharedSession.cursor}` });
+			syncVerdict(hostSessionId, `syncResult: path=reuse sessionId=${sharedSession.sessionId} cursor=${sharedSession.cursor}`);
 			return { sessionId: sharedSession.sessionId };
 		}
 	}
@@ -1201,7 +1214,7 @@ function syncSharedSession(
 	if (sharedSession && !sharedSession.needsRebuild && priorMessages.length < sharedSession.cursor) {
 		if (options?.reentrant) {
 			debug(`Case 1 synthetic: clean start for shorter context, preserving shared session ${sharedSession.sessionId.slice(0, 8)}, cursor=${sharedSession.cursor}`);
-			verdict("sync", { detail: `syncResult: path=clean-start preserve-shared sessionId=${sharedSession.sessionId} cursor=${sharedSession.cursor}` });
+			syncVerdict(hostSessionId, `syncResult: path=clean-start preserve-shared sessionId=${sharedSession.sessionId} cursor=${sharedSession.cursor}`);
 			return { sessionId: null, preserveSharedSession: true };
 		}
 		debug(`Case 3→4: Pi history compressed ${sharedSession.cursor}→${priorMessages.length} msgs on a top-level turn, forcing rebuild`);
@@ -1224,7 +1237,7 @@ function syncSharedSession(
 			);
 		}
 		debug(`Case 1: clean start, ${messages.length} total messages`);
-		verdict("sync", { detail: `syncResult: path=clean-start` });
+		syncVerdict(hostSessionId, `syncResult: path=clean-start`);
 		return { sessionId: null };
 	}
 	const previousSessionId = sharedSession?.sessionId;
@@ -1263,7 +1276,7 @@ function syncSharedSession(
 		debug(`Case 4 post-abort: ${priorMessages.length} total → new session ${session.sessionId.slice(0, 8)} (was ${previousSessionId.slice(0, 8)}, rotated to avoid race with orphan writer), ${session.records.length} records`);
 	}
 	debugSessionPaths(`${session.sessionId.slice(0, 8)}`, cwd, session.jsonlPath);
-	verdict("sync", { detail: `syncResult: path=rebuild sessionId=${session.sessionId} priors=${priorMessages.length} ${previousSessionId === undefined ? "first" : preserveId ? "preserved" : "rotated-post-abort"}` });
+	syncVerdict(hostSessionId, `syncResult: path=rebuild sessionId=${session.sessionId} priors=${priorMessages.length} ${previousSessionId === undefined ? "first" : preserveId ? "preserved" : "rotated-post-abort"}`);
 	return { sessionId: session.sessionId };
 }
 
@@ -2415,7 +2428,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// will actually be given, or a >200K conversation rebuilt on the bare id later
 	// fails with "Prompt is too long" (issue #42). reentrant tells sync whether a
 	// context shorter than the cursor is subagent isolation or lost history.
-	const syncResult = syncSharedSession(context.messages, cwd, customToolNameToSdk, cliModel, { reentrant: isReentrant, foreignConversation });
+	const syncResult = syncSharedSession(context.messages, cwd, customToolNameToSdk, cliModel, { reentrant: isReentrant, foreignConversation, ...(hostSessionId ? { hostSessionId } : {}) });
 	const { sessionId: resumeSessionId } = syncResult;
 	const promptBlocks = extractUserPromptBlocks(context.messages);
 	let promptText = extractUserPrompt(context.messages) ?? "";

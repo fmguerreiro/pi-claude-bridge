@@ -1835,6 +1835,11 @@ function processAssistantMessage(message: SDKMessage, model: Model<any>, customT
 	if (c.turnSawStreamEvent) return;
 	const assistantMsg = (message as any).message;
 	if (!assistantMsg?.content) return;
+	// Synthetic SDK diagnostics must stay out of model output or Pi cannot retry safely.
+	if (assistantMsg.model === "<synthetic>") {
+		debug("processAssistantMessage: skipping synthetic assistant diagnostic");
+		return;
+	}
 	c.turnToolCallIds = [];
 	debug(`processAssistantMessage fallback: ${assistantMsg.content.length} blocks, types=${assistantMsg.content.map((b: any) => b.type).join(",")}`);
 	for (const block of assistantMsg.content) {

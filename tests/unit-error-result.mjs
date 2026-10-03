@@ -75,15 +75,16 @@ describe("error results", () => {
 		assert.strictEqual(terminal.error.errorMessage, errorResult.result);
 	});
 
-	it("does not re-emit text the synthetic assistant message already delivered", async () => {
+	it("keeps synthetic error diagnostics out of model output", async () => {
 		const c = makeCtx();
 		await consume(c, [
 			{ type: "assistant", message: { model: "<synthetic>", content: [{ type: "text", text: errorResult.result }] } },
 			errorResult,
 		]);
 
-		const texts = c.turnOutput.content.filter((b) => b.type === "text");
-		assert.deepStrictEqual(texts.map((b) => b.text), [errorResult.result]);
+		assert.deepStrictEqual(c.turnOutput.content, []);
+		assert.strictEqual(c.turnOutput.stopReason, "error");
+		assert.strictEqual(c.turnOutput.errorMessage, errorResult.result);
 	});
 
 	it("still streams and finalizes a successful result normally", async () => {

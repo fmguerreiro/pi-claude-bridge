@@ -10,6 +10,8 @@ export function verifyWrittenSession(jsonlPath: string, expectedSessionId: strin
 	try {
 		st = statSync(jsonlPath);
 	} catch (e) {
+		// `save()` no-ops with nothing pending, so a zero-record session has no file.
+		if (expectedRecordCount === 0) return warnings;
 		warnings.push(`file missing after save — path=${jsonlPath} err=${e.message}`);
 		return warnings;
 	}

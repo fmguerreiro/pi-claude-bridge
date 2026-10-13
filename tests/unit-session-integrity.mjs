@@ -58,11 +58,15 @@ describe("verifyWrittenSession", () => {
 		assert.deepEqual(verifyWrittenSession(path, SID, 3), []);
 	});
 
-	it("warns when file is missing", () => {
+	it("warns when a file that should hold records is missing", () => {
 		const missing = join(dir, "nope.jsonl");
-		const warnings = verifyWrittenSession(missing, SID, 0);
+		const warnings = verifyWrittenSession(missing, SID, 3);
 		assert.equal(warnings.length, 1);
 		assert.match(warnings[0], /file missing/);
+	});
+
+	it("stays silent when a zero-record session wrote no file", () => {
+		assert.deepEqual(verifyWrittenSession(join(dir, "nope.jsonl"), SID, 0), []);
 	});
 
 	it("warns on record count mismatch", () => {

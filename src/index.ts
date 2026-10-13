@@ -1038,6 +1038,10 @@ function verifyWrittenSession(
 	expectedRecordCount: number,
 	cwd: string,
 ): void {
+	if (expectedRecordCount === 0) {
+		// No file fault, but an empty rebuild leaves Claude resuming with nothing.
+		debug(`WARNING session verify: zero records imported — path=${jsonlPath} sessionId=${expectedSessionId.slice(0, 8)}`);
+	}
 	const warnings = _verifyWrittenSession(jsonlPath, expectedSessionId, expectedRecordCount);
 	for (const msg of warnings) {
 		debug(`WARNING session verify: ${msg}`);
@@ -1048,7 +1052,7 @@ function verifyWrittenSession(
 			(DEBUG ? ` and attach ${DEBUG_LOG_PATH}` : ` (rerun with CLAUDE_BRIDGE_DEBUG=1 to capture a debug log)`),
 			"warning",
 		);
-		diagDump("session_verify_fail", { msg, jsonlPath, cwd, realpath: safeRealpath(cwd), claudeConfigDir: process.env.CLAUDE_CONFIG_DIR ?? null });
+		diagDump("session_verify_fail", { msg, jsonlPath, cwd, realpath: safeRealpath(cwd), claudeConfigDir: process.env.CLAUDE_CONFIG_DIR ?? null, expectedRecordCount });
 	}
 }
 

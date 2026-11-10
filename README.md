@@ -29,6 +29,8 @@ Behind the scenes, pi's tools are bridged to Claude Code but it should all work 
 
 **1M Context:** Opus 5, Opus 4.8, and Opus 4.7 get 1M context by default. Opus 4.6 only gets 1M if you're on a Max plan or pay for Extra Usage. Sonnet 4.6 only gets 1M if you pay for Extra Usage. You will need to set `provider.plan` and/or `provider.longContextExtraUsage` for 1M context in Opus 4.6/Sonnet 4.6 as described in [Configuration](#configuration).
 
+**Login:** on a host that supports it, pi offers a "login with Claude Code" action that runs `claude auth login`/`claude auth status` against the exact `claude` binary the provider streams through (your `provider.pathToClaudeCodeExecutable` if set, else the bundled binary). Claude Code keeps its own credential under `CLAUDE_CONFIG_DIR` (`~/.claude` by default) — pi never sees or stores it. On a host without that support, log in the normal way: run `claude` once outside pi, or `claude auth login` directly.
+
 ## AskClaude Tool
 
 Opt-in: set `askClaude.enabled` to `true` (see [Configuration](#configuration)). Available when using any non-claude-bridge provider. Pi's LLM can delegate tasks to Claude Code and wait for it to answer a question or perform a task. Examples of how to use:

@@ -17,6 +17,7 @@ import { verifyWrittenSession as _verifyWrittenSession } from "./session-verify.
 import { extractAllToolResults as _extractAllToolResults, type McpResult } from "./extract-tool-results.js";
 import { QueryContext, ctx } from "./query-state.js";
 import { makePromptStream, userMessage, type PromptStream } from "./prompt-stream.js";
+import { resolveClaudeExecutableCommand } from "./claude-executable.js";
 import {
 	claudeCodeSettingSources,
 	claudeCodeSettings,
@@ -49,6 +50,11 @@ import {
 	planInvokeRecovery,
 	recoveredToolResultPending,
 } from "./invoke-recovery.js";
+
+// Not in the installed pi-coding-agent ProviderConfig type yet: hosts recognizing it offer a
+// "login with Claude Code" action that shells out to loginCommand/statusCommand (argv, no
+// shell) rather than storing a credential pi manages itself.
+type ExternalLoginConfig = { name: string; loginCommand: string[]; statusCommand: string[] };
 
 // OMP loads legacy Pi extensions through a package compatibility layer, but a
 // few former top-level helpers no longer exist. Read them dynamically so the
@@ -3103,6 +3109,16 @@ export default function (pi: ExtensionAPI) {
 	// the entry carries the api and the apiKey the model resolves through. The pin
 	// is what keeps a child instance from taking the parent's place in it.
 	// See ACTIVE_STREAM_SIMPLE_KEY for the full mechanism.
+	// Claude Code owns the credentials; externalLogin invokes its login and status commands.
+	const claudeExecutableCommand = resolveClaudeExecutableCommand(providerSettings.pathToClaudeCodeExecutable);
+	const externalLogin: ExternalLoginConfig | undefined = claudeExecutableCommand
+		? {
+				name: "Claude Code",
+				loginCommand: [...claudeExecutableCommand, "auth", "login"],
+				statusCommand: [...claudeExecutableCommand, "auth", "status"],
+			}
+		: undefined;
+	if (!claudeExecutableCommand) debug("externalLogin: no claude executable resolved, omitting externalLogin registration");
 
 	const pinnedStreamSimple = pinStreamSimple(globalThis as Record<symbol, unknown>, streamClaudeAgentSdk);
 	debug(`provider: registering with ${pinnedStreamSimple === streamClaudeAgentSdk ? "own" : "pinned parent"} streamSimple (module=${moduleInstanceId})`);
@@ -3113,7 +3129,9 @@ export default function (pi: ExtensionAPI) {
 		models: registeredModels,
 		// Cast: pi-ai AssistantMessageEventStream diamond dep between pi-coding-agent and pi-agent-core
 		streamSimple: pinnedStreamSimple as unknown as ProviderConfig["streamSimple"],
-	});
+		// Cast: externalLogin isn't in the installed pi-coding-agent types yet.
+		...(externalLogin ? { externalLogin } : {}),
+	} as ProviderConfig & { externalLogin?: ExternalLoginConfig });
 
 	// --- AskClaude tool ---
 
